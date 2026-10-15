@@ -1,0 +1,4 @@
+# Your game files and build output never belong in the repository
+game/*
+!game/PUT_YOUR_GAME_FILES_HERE.txt
+out/
