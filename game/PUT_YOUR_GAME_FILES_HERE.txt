@@ -1,0 +1,2 @@
+Put ALL of your game's files directly in this folder (data.win, any .dat/.ogg files and folders).
+.exe and .dll files are skipped automatically.

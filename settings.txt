@@ -1,0 +1,20 @@
+# Settings for your .nro. Change the text after the = sign, then run build.bat (Windows) or build.sh (Mac/Linux).
+# Lines starting with # are notes and are ignored.
+
+# Name shown in the Switch homebrew menu
+TITLE=My Game
+
+# Author shown in the homebrew menu (the game's creator)
+AUTHOR=Unknown
+
+# Version shown in the homebrew menu
+VERSION=1.0.0
+
+# Folder name on the SD card. Saves go to SD:/switch/<FOLDER>/ and the file is called <FOLDER>.nro
+# Letters, numbers, - and _ only (no spaces).
+FOLDER=MyGame
+
+# yes or no. Turn this on if the game's colours look completely wrong (for example everything red and blue).
+# Some GameMaker: Studio 1.4 games build their colour palette pixel by pixel; this makes those pixels land
+# exactly where the game expects, like on Windows. Leave it on "no" if colours look right.
+EXACT_POINTS=no

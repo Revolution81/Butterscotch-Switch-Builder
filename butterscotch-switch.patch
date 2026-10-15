@@ -1,0 +1,1818 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b44b96d..8a7c03a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -121,6 +121,12 @@ endif()
+ option(ENABLE_MODERN_GL "Enable the modern OpenGL renderer" ON)
+ option(ENABLE_NOOP_RENDERER "Enable the no-op renderer (headless stub, no drawing)" OFF)
+ option(ENABLE_PHYSICS "Enable Box2D physics support" ON)
++# Some GM:S 1.4 games build palette/lookup textures pixel by pixel with draw_point. On the original Windows runner
++# those points land exactly on (x, y); with the usual 1-pixel primitive offset the whole palette shifts (wrong colours).
++option(BS_EXACT_POINTS "draw_point lands exactly on (x, y) (fixes shifted palettes in some GM:S 1.4 games)" OFF)
++if(BS_EXACT_POINTS)
++    add_compile_definitions(BS_EXACT_POINTS)
++endif()
+ # Noop renderer is exclusive to the noop desktop backend (no window, no GL).
+ # Auto-enable for BACKEND=noop and reject otherwise.
+ if(BACKEND STREQUAL "noop")
+@@ -392,6 +398,10 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
+         set(VM_STUB_LOGS_DEFAULT OFF)
+     elseif(PLATFORM STREQUAL "switch")
+         add_compile_definitions(PLATFORM_SWITCH)
++        set(NX_APP_DIR "" CACHE STRING "SD card folder for saves, e.g. sdmc:/switch/MyGame (default sdmc:/switch/butterscotch)")
++        if (NX_APP_DIR)
++            add_compile_definitions(BS_SWITCH_APP_DIR="${NX_APP_DIR}")
++        endif()
+ 
+         set(VM_GML_PROFILER_DEFAULT OFF)
+         set(VM_TRACING_DEFAULT OFF)
+@@ -605,12 +615,21 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
+             NAME ${VITA_APP_NAME}
+         )
+     elseif (PLATFORM STREQUAL "switch")
+-        nx_generate_nacp(OUTPUT Butterscotch.nacp NAME "Butterscotch" AUTHOR "Butterscotch" VERSION "1.0.0")
++        # Homebrew-menu metadata; override with -DNX_APP_TITLE=... -DNX_APP_AUTHOR=... -DNX_APP_VERSION=... -DNX_APP_ICON=icon.jpg
++        set(NX_APP_TITLE "Butterscotch" CACHE STRING "Title shown in the homebrew menu")
++        set(NX_APP_AUTHOR "Butterscotch" CACHE STRING "Author shown in the homebrew menu")
++        set(NX_APP_VERSION "1.0.0" CACHE STRING "Version shown in the homebrew menu")
++        set(NX_APP_ICON "" CACHE FILEPATH "256x256 JPEG icon for the homebrew menu")
++        nx_generate_nacp(OUTPUT Butterscotch.nacp NAME "${NX_APP_TITLE}" AUTHOR "${NX_APP_AUTHOR}" VERSION "${NX_APP_VERSION}")
++        set(NX_NRO_EXTRA_ARGS "")
++        if (NX_APP_ICON AND EXISTS "${NX_APP_ICON}")
++            list(APPEND NX_NRO_EXTRA_ARGS ICON "${NX_APP_ICON}")
++        endif()
+         set(ROMFS_DIR "${CMAKE_CURRENT_BINARY_DIR}/romfs")
+         if (EXISTS "${ROMFS_DIR}" AND IS_DIRECTORY "${ROMFS_DIR}")
+-            nx_create_nro(butterscotch NACP Butterscotch.nacp ROMFS "${ROMFS_DIR}")
++            nx_create_nro(butterscotch NACP Butterscotch.nacp ROMFS "${ROMFS_DIR}" ${NX_NRO_EXTRA_ARGS})
+         else()
+-            nx_create_nro(butterscotch NACP Butterscotch.nacp)
++            nx_create_nro(butterscotch NACP Butterscotch.nacp ${NX_NRO_EXTRA_ARGS})
+         endif()
+     elseif (PLATFORM STREQUAL "web")
+         set_target_properties(butterscotch PROPERTIES SUFFIX ".mjs")
+diff --git a/src/audio/miniaudio/ma_audio_system.c b/src/audio/miniaudio/ma_audio_system.c
+index b6b2484..021e1ee 100644
+--- a/src/audio/miniaudio/ma_audio_system.c
++++ b/src/audio/miniaudio/ma_audio_system.c
+@@ -86,6 +86,11 @@ static SoundInstance* findInstanceById(MaAudioSystem* ma, int32_t instanceId) {
+     return nullptr;
+ }
+ 
++static int32_t maGetInstanceSoundIndex(AudioSystem* audio, int32_t instanceId) {
++    SoundInstance* inst = findInstanceById((MaAudioSystem*) audio, instanceId);
++    return inst != nullptr ? inst->soundIndex : -1;
++}
++
+ // Helper: resolve external audio file path from Sound entry
+ static char* resolveExternalPath(MaAudioSystem* ma, Sound* sound) {
+     const char* file = sound->file;
+@@ -176,7 +181,7 @@ static void maDestroy(AudioSystem* audio) {
+     // Free loaded audio groups. The main data.win is owned by the caller, so skip index 0.
+     if (arrlen(ma->base.audioGroups) > 1) {
+         for (int32_t i = 1; i < (int32_t) arrlen(ma->base.audioGroups); i++) {
+-            DataWin_free(ma->base.audioGroups[i]);
++            if (ma->base.audioGroups[i] != nullptr) DataWin_free(ma->base.audioGroups[i]);
+         }
+     }
+     arrfree(ma->base.audioGroups);
+@@ -273,7 +278,7 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
+ 
+         if (inAudo) {
+             // Embedded audio: decode from AUDO chunk memory
+-            if (0 > sound->audioFile || (uint32_t) sound->audioFile >= ma->base.audioGroups[sound->audioGroup]->audo.count) {
++            if (AudioSystem_getGroup(&ma->base, sound->audioGroup) == nullptr || 0 > sound->audioFile || (uint32_t) sound->audioFile >= AudioSystem_getGroup(&ma->base, sound->audioGroup)->audo.count) {
+                 logWarn("Audio: Invalid audio file index %d for sound '%s'\n", sound->audioFile, sound->name);
+                 return -1;
+             }
+@@ -760,7 +765,7 @@ static float maGetSoundLength(AudioSystem* audio, int32_t soundOrInstance) {
+     ma_decoder decoder;
+     ma_result decResult;
+     if (inAudo) {
+-        if (0 > sound->audioFile || (uint32_t) sound->audioFile >= ma->base.audioGroups[sound->audioGroup]->audo.count) return 0.0f;
++        if (AudioSystem_getGroup(&ma->base, sound->audioGroup) == nullptr || 0 > sound->audioFile || (uint32_t) sound->audioFile >= AudioSystem_getGroup(&ma->base, sound->audioGroup)->audo.count) return 0.0f;
+         DataWin* audioGroup = ma->base.audioGroups[sound->audioGroup];
+         DataWin_loadAudoIfNeeded(audioGroup, (uint32_t)sound->audioFile);
+         AudioEntry* entry = &audioGroup->audo.entries[sound->audioFile];
+@@ -812,6 +817,7 @@ static void maSetGroupGain(AudioSystem* audio, int32_t groupIndex, float gain, u
+ }
+ 
+ static void maGroupLoad(AudioSystem* audio, int32_t groupIndex) {
++    if (AudioSystem_getGroup(audio, groupIndex) != nullptr) return; // already loaded
+     if (groupIndex > 0 && audio->dw->agrp.count > (uint32_t) groupIndex) {
+         AudioGroup* audioGroupEntry = &audio->dw->agrp.audioGroups[groupIndex];
+ 
+@@ -833,7 +839,7 @@ static void maGroupLoad(AudioSystem* audio, int32_t groupIndex) {
+             logWarn("Audio: Wanted to load Audio Group %d, but Audio Group %d does not exist in the file system!\n", groupIndex, groupIndex);
+             free(buf);
+             DataWin* dw = (DataWin *)safeCalloc(1, sizeof(DataWin));
+-            arrput(audio->audioGroups, dw);
++            AudioSystem_storeGroup(audio, groupIndex, dw);
+             return;
+         }
+ 
+@@ -843,7 +849,7 @@ static void maGroupLoad(AudioSystem* audio, int32_t groupIndex) {
+         if (audio->dw->mappedFile)
+             options.loadType = DATAWINLOADTYPE_MAP_FILE;
+         DataWin *audioGroup = DataWin_parse(((MaAudioSystem*)audio)->fileSystem->vtable->resolvePath(((MaAudioSystem*)audio)->fileSystem, buf), options);
+-        arrput(audio->audioGroups, audioGroup);
++        AudioSystem_storeGroup(audio, groupIndex, audioGroup);
+         free(buf);
+     } else {
+         logWarn("Audio: Wanted to load Audio Group %d, but Audio Group %d does not exist in the AGPR!\n", groupIndex, groupIndex);
+@@ -851,7 +857,7 @@ static void maGroupLoad(AudioSystem* audio, int32_t groupIndex) {
+ }
+ 
+ static bool maGroupIsLoaded(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t groupIndex) {
+-    return (arrlen(audio->audioGroups) > groupIndex);
++    return AudioSystem_getGroup(audio, groupIndex) != nullptr;
+ }
+ 
+ // ===[ Audio Streams ]===
+@@ -953,6 +959,7 @@ MaAudioSystem* MaAudioSystem_create(DataWin* dataWin) {
+     maAudioSystemVtable.getTrackPosition = maGetTrackPosition;
+     maAudioSystemVtable.setTrackPosition = maSetTrackPosition;
+     maAudioSystemVtable.getSoundLength = maGetSoundLength;
++    maAudioSystemVtable.getInstanceSoundIndex = maGetInstanceSoundIndex;
+     maAudioSystemVtable.setMasterGain = maSetMasterGain;
+     maAudioSystemVtable.setMasterGainForListener = maSetMasterGainForListener;
+     maAudioSystemVtable.setChannelCount = maSetChannelCount;
+diff --git a/src/audio/openal/al_audio_system.c b/src/audio/openal/al_audio_system.c
+index 52c4cab..317de8b 100644
+--- a/src/audio/openal/al_audio_system.c
++++ b/src/audio/openal/al_audio_system.c
+@@ -180,6 +180,11 @@ static SoundInstance* findInstanceById(AlAudioSystem* ma, int32_t instanceId) {
+     return nullptr;
+ }
+ 
++static int32_t maGetInstanceSoundIndex(AudioSystem* audio, int32_t instanceId) {
++    SoundInstance* inst = findInstanceById((AlAudioSystem*) audio, instanceId);
++    return inst != nullptr ? inst->soundIndex : -1;
++}
++
+ // Helper: resolve external audio file path from Sound entry
+ static char* resolveExternalPath(AlAudioSystem* ma, Sound* sound) {
+     const char* file = sound->file;
+@@ -256,7 +261,7 @@ static void maDestroy(AudioSystem* audio) {
+     // Free loaded audio groups. The main data.win is owned by the caller, so skip index 0.
+     if (arrlen(ma->base.audioGroups) > 1) {
+         for (int32_t i = 1; i < (int32_t) arrlen(ma->base.audioGroups); i++) {
+-            DataWin_free(ma->base.audioGroups[i]);
++            if (ma->base.audioGroups[i] != nullptr) DataWin_free(ma->base.audioGroups[i]);
+         }
+     }
+     arrfree(ma->base.audioGroups);
+@@ -581,7 +586,7 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
+ 
+         if (inAudo) {
+            // Embedded audio: decode from AUDO chunk memory
+-            if (0 > sound->audioFile || (uint32_t) sound->audioFile >= ma->base.audioGroups[sound->audioGroup]->audo.count) {
++            if (AudioSystem_getGroup(&ma->base, sound->audioGroup) == nullptr || 0 > sound->audioFile || (uint32_t) sound->audioFile >= AudioSystem_getGroup(&ma->base, sound->audioGroup)->audo.count) {
+                 logWarn("Audio: Invalid audio file index %d for sound '%s'\n", sound->audioFile, sound->name);
+                 alDeleteSources(1, &slot->alSource);
+                 alDeleteBuffers(1, &slot->alBuffer);
+@@ -591,6 +596,52 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
+             DataWin_loadAudoIfNeeded(ma->base.audioGroups[sound->audioGroup], (uint32_t)sound->audioFile);
+             AudioEntry* entry = &ma->base.audioGroups[sound->audioGroup]->audo.entries[sound->audioFile];
+ 
++            // Long compressed tracks (music): stream from memory a few thousand samples at a time instead of decoding the
++            // whole song on the main thread, which caused a short hitch every time new music started.
++            if (entry->dataSize >= 4 && memcmp(entry->data, "OggS", 4) == 0) {
++                int vErr = 0;
++                stb_vorbis* v = stb_vorbis_open_memory((const unsigned char*) entry->data, (int) entry->dataSize, &vErr, nullptr);
++                if (v != nullptr) {
++                    stb_vorbis_info info = stb_vorbis_get_info(v);
++                    unsigned int lengthSamples = stb_vorbis_stream_length_in_samples(v);
++                    if ((info.channels == 1 || info.channels == 2) && info.sample_rate > 0 && lengthSamples > info.sample_rate * 8u) {
++                        alDeleteBuffers(1, &slot->alBuffer);
++                        slot->alBuffer = 0;
++                        slot->streaming = true;
++                        slot->loop = loop;
++                        slot->vorbis = v;
++                        slot->streamChannels = info.channels;
++                        slot->streamSampleRate = (int) info.sample_rate;
++                        slot->streamFormat = (info.channels == 2) ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
++                        slot->streamLengthSamples = lengthSamples;
++                        slot->streamLengthSeconds = (float) lengthSamples / (float) info.sample_rate;
++                        slot->decodeScratch = (int16_t*)safeMalloc(AL_STREAM_BUFFER_SAMPLES * slot->streamChannels * sizeof(int16_t));
++                        alGenBuffers(AL_STREAM_BUFFER_COUNT, slot->streamBuffers);
++                        int primed = 0;
++                        if (alGetError() == AL_NO_ERROR) {
++                            for (int i = 0; AL_STREAM_BUFFER_COUNT > i; i++) {
++                                if (!streamFillBuffer(slot, slot->streamBuffers[i])) break;
++                                alSourceQueueBuffers(slot->alSource, 1, &slot->streamBuffers[i]);
++                                primed++;
++                            }
++                        }
++                        if (primed == 0) {
++                            logWarn("Audio: Failed to start streaming '%s'\n", sound->name);
++                            alDeleteSources(1, &slot->alSource);
++                            alDeleteBuffers(AL_STREAM_BUFFER_COUNT, slot->streamBuffers);
++                            stb_vorbis_close(v);
++                            free(slot->decodeScratch);
++                            slot->decodeScratch = nullptr;
++                            slot->vorbis = nullptr;
++                            slot->streaming = false;
++                            return -1;
++                        }
++                        goto sound_data_ready;
++                    }
++                    stb_vorbis_close(v);
++                }
++            }
++
+             uint32_t channels = 0;
+             uint32_t sampleRate = 0;
+             uint32_t bitsPerSample = 0;
+@@ -711,6 +762,7 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
+         }
+     }
+ 
++sound_data_ready:
+     // Apply properties
+     float volume = isStream ? streamGain : sound->volume;
+     float pitch = isStream ? streamPitch : sound->pitch;
+@@ -722,7 +774,7 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
+     }
+     // AL_LOOPING on a streaming source only loops the currently-playing buffer, not the whole queue,
+     // so streaming looping is handled by streamFillBuffer calling stb_vorbis_seek_start when the decoder runs out.
+-    if (!isStream)
++    if (!slot->streaming)
+         alSourcei(slot->alSource, AL_LOOPING, loop ? AL_TRUE : AL_FALSE);
+ 
+     // Set up instance tracking
+@@ -1053,19 +1105,64 @@ static float maGetTrackPosition(AudioSystem* audio, int32_t soundOrInstance) {
+     return 0.0f;
+ }
+ 
++// Seek a streaming instance: drop the queued audio, move the decoder, refill and resume in the same play/pause state.
++static void streamSeek(SoundInstance* inst, float positionSeconds) {
++    if (0 >= inst->streamSampleRate) return;
++    ALint state = 0;
++    alGetSourcei(inst->alSource, AL_SOURCE_STATE, &state);
++    alSourceStop(inst->alSource);
++    ALint queued = 0;
++    alGetSourcei(inst->alSource, AL_BUFFERS_QUEUED, &queued);
++    repeat(queued, i) {
++        ALuint b;
++        alSourceUnqueueBuffers(inst->alSource, 1, &b);
++    }
++
++    uint64_t target = positionSeconds > 0.0f ? (uint64_t) ((double) positionSeconds * (double) inst->streamSampleRate) : 0;
++    if (inst->streamLengthSamples > 0) {
++        if (inst->loop) target %= (uint64_t) inst->streamLengthSamples;
++        else if (target > (uint64_t) inst->streamLengthSamples) target = (uint64_t) inst->streamLengthSamples;
++    }
++    if (inst->vorbis != nullptr) {
++        stb_vorbis_seek((stb_vorbis*) inst->vorbis, (unsigned int) target);
++    } else if (inst->wavFile != nullptr) {
++        uint64_t frameBytes = (uint64_t) inst->streamChannels * sizeof(int16_t);
++        uint64_t offset = target * frameBytes;
++        if (offset > inst->wavDataBytes) offset = inst->wavDataBytes;
++        fseek(inst->wavFile, (long) (inst->wavDataStart + (int64_t) offset), SEEK_SET);
++        inst->wavSampleBytesRemaining = inst->wavDataBytes - (uint32_t) offset;
++    }
++    inst->playedSamples = target;
++    inst->streamEnded = false;
++
++    for (int i = 0; AL_STREAM_BUFFER_COUNT > i; i++) {
++        if (!streamFillBuffer(inst, inst->streamBuffers[i])) { inst->streamEnded = true; break; }
++        alSourceQueueBuffers(inst->alSource, 1, &inst->streamBuffers[i]);
++    }
++    if (state == AL_PLAYING || state == AL_PAUSED) {
++        alSourcePlay(inst->alSource);
++        if (state == AL_PAUSED) alSourcePause(inst->alSource);
++    }
++}
++
++static void setInstanceTrackPosition(SoundInstance* inst, float positionSeconds) {
++    if (inst->streaming) streamSeek(inst, positionSeconds);
++    else alSourcef(inst->alSource, AL_SEC_OFFSET, positionSeconds);
++}
++
+ static void maSetTrackPosition(AudioSystem* audio, int32_t soundOrInstance, float positionSeconds) {
+     AlAudioSystem* ma = (AlAudioSystem*) audio;
+ 
+     if (isValidSoundInstanceId(soundOrInstance)) {
+         SoundInstance* inst = findInstanceById(ma, soundOrInstance);
+         if (inst != nullptr) {
+-            alSourcef(inst->alSource, AL_SEC_OFFSET, positionSeconds);
++            setInstanceTrackPosition(inst, positionSeconds);
+         }
+     } else {
+         repeat(MAX_SOUND_INSTANCES, i) {
+             SoundInstance* inst = &ma->instances[i];
+             if (inst->active && inst->soundIndex == soundOrInstance) {
+-            alSourcef(inst->alSource, AL_SEC_OFFSET, positionSeconds);
++                setInstanceTrackPosition(inst, positionSeconds);
+             }
+         }
+     }
+@@ -1138,7 +1235,7 @@ static float maGetSoundLength(AudioSystem* audio, int32_t soundOrInstance) {
+     bool isCompressed = (sound->flags & AUDIO_ENTRY_FLAG_IS_COMPRESSED) != 0;
+     bool inAudo = !isRegular || isEmbedded || isCompressed;
+     if (inAudo) {
+-        if (0 > sound->audioFile || (uint32_t) sound->audioFile >= ma->base.audioGroups[sound->audioGroup]->audo.count) return 0.0f;
++        if (AudioSystem_getGroup(&ma->base, sound->audioGroup) == nullptr || 0 > sound->audioFile || (uint32_t) sound->audioFile >= AudioSystem_getGroup(&ma->base, sound->audioGroup)->audo.count) return 0.0f;
+         DataWin_loadAudoIfNeeded(ma->base.audioGroups[sound->audioGroup], (uint32_t)sound->audioFile);
+         AudioEntry* entry = &ma->base.audioGroups[sound->audioGroup]->audo.entries[sound->audioFile];
+ 
+@@ -1147,6 +1244,14 @@ static float maGetSoundLength(AudioSystem* audio, int32_t soundOrInstance) {
+             uint32_t bytesPerSample = channels * (bitsPerSample / 8);
+             if (bytesPerSample > 0)
+                 return (float) audioDataLen / (float)(sampleRate * bytesPerSample);
++        } else if (entry->dataSize >= 4 && memcmp(entry->data, "OggS", 4) == 0) {
++            // Compressed (Ogg Vorbis) audio: the byte size says nothing about the duration, so ask the decoder.
++            int err = 0;
++            stb_vorbis* v = stb_vorbis_open_memory((const unsigned char*) entry->data, (int) entry->dataSize, &err, nullptr);
++            if (v == nullptr) return 0.0f;
++            float seconds = stb_vorbis_stream_length_in_seconds(v);
++            stb_vorbis_close(v);
++            return seconds;
+         } else {
+             // Raw PCM: assume stereo 16-bit 44100 Hz
+             return (float) entry->dataSize / (float)(44100 * 2 * 2);
+@@ -1191,6 +1296,7 @@ static void maSetGroupGain(AudioSystem* audio, int32_t groupIndex, float gain, u
+ }
+ 
+ static void maGroupLoad(AudioSystem* audio, int32_t groupIndex) {
++    if (AudioSystem_getGroup(audio, groupIndex) != nullptr) return; // already loaded
+     if (groupIndex > 0) {
+         int sz = snprintf(nullptr, 0, "audiogroup%d.dat", groupIndex);
+         char *buf = (char *)safeMalloc(sz + 1);
+@@ -1211,13 +1317,13 @@ static void maGroupLoad(AudioSystem* audio, int32_t groupIndex) {
+         if (audio->dw->mappedFile)
+             options.loadType = DATAWINLOADTYPE_MAP_FILE;
+         DataWin *audioGroup = DataWin_parse(((AlAudioSystem*)audio)->fileSystem->vtable->resolvePath(((AlAudioSystem*)audio)->fileSystem, buf), options);
+-        arrput(audio->audioGroups, audioGroup);
++        AudioSystem_storeGroup(audio, groupIndex, audioGroup);
+         free(buf);
+     }
+ }
+ 
+ static bool maGroupIsLoaded(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t groupIndex) {
+-    return (arrlen(audio->audioGroups) > groupIndex);
++    return AudioSystem_getGroup(audio, groupIndex) != nullptr;
+ }
+ 
+ // ===[ Audio Streams ]===
+@@ -1313,6 +1419,7 @@ AlAudioSystem* AlAudioSystem_create(void) {
+     AlAudioSystemVtable.getTrackPosition = maGetTrackPosition;
+     AlAudioSystemVtable.setTrackPosition = maSetTrackPosition;
+     AlAudioSystemVtable.getSoundLength = maGetSoundLength;
++    AlAudioSystemVtable.getInstanceSoundIndex = maGetInstanceSoundIndex;
+     AlAudioSystemVtable.setMasterGain = maSetMasterGain;
+     AlAudioSystemVtable.setMasterGainForListener = maSetMasterGainForListener;
+     AlAudioSystemVtable.setChannelCount = maSetChannelCount;
+diff --git a/src/audio_system.h b/src/audio_system.h
+index a54b5ce..8ccabe7 100644
+--- a/src/audio_system.h
++++ b/src/audio_system.h
+@@ -6,6 +6,7 @@
+ #include <stdbool.h>
+ 
+ #include "data_win.h"
++#include "stb_ds.h"
+ #include "file_system.h"
+ #include "utils.h"
+ 
+@@ -46,6 +47,8 @@ typedef struct {
+     // Total length of a sound in seconds. Accepts either a SOND index or an active sound instance id.
+     // Returns 0.0 if unknown (e.g. stream not yet loaded or invalid index).
+     float (*getSoundLength)(AudioSystem* audio, int32_t soundOrInstance);
++    // Sound asset index of an active sound instance, or -1. Optional (may be nullptr).
++    int32_t (*getInstanceSoundIndex)(AudioSystem* audio, int32_t instanceId);
+     void (*setMasterGain)(AudioSystem* audio, float gain);
+     void (*setMasterGainForListener)(AudioSystem* audio, float gain, int32_t listenerId);
+     void (*setChannelCount)(AudioSystem* audio, int32_t count);
+@@ -67,6 +70,18 @@ struct AudioSystem {
+     uint32_t groupGainCount;
+ };
+ 
++// Audio groups are stored at their real group index (games may load group 2 before group 1).
++// Slots for groups that haven't been loaded yet are nullptr.
++static inline DataWin* AudioSystem_getGroup(const AudioSystem* audio, int32_t groupIndex) {
++    if (0 > groupIndex || groupIndex >= (int32_t) arrlen(audio->audioGroups)) return nullptr;
++    return audio->audioGroups[groupIndex];
++}
++
++static inline void AudioSystem_storeGroup(AudioSystem* audio, int32_t groupIndex, DataWin* group) {
++    while ((int32_t) arrlen(audio->audioGroups) <= groupIndex) arrput(audio->audioGroups, (DataWin*) nullptr);
++    audio->audioGroups[groupIndex] = group;
++}
++
+ static inline int32_t AudioSystem_soundGroup(const AudioSystem* audio, int32_t soundIndex) {
+     if (audio == nullptr || audio->dw == nullptr || soundIndex < 0 ||
+         (uint32_t)soundIndex >= audio->dw->sond.count) return 0;
+diff --git a/src/data_win.c b/src/data_win.c
+index 5c609c9..7848831 100644
+--- a/src/data_win.c
++++ b/src/data_win.c
+@@ -1737,6 +1737,7 @@ static void readRoomTiles(BinaryReader* reader, DataWin* dw, Room* room) {
+             tile->scaleY = BinaryReader_readFloat32(reader);
+             tile->color = BinaryReader_readUint32(reader);
+             tile->alpha = tileAlphaFromColor(tile->color);
++            tile->hidden = false;
+         }
+     } else {
+         room->tiles = nullptr;
+@@ -1819,6 +1820,7 @@ static void readRoomLayers(BinaryReader* reader, DataWin* dw, Room* room) {
+                         tile->scaleY = BinaryReader_readFloat32(reader);
+                         tile->color = BinaryReader_readUint32(reader);
+                         tile->alpha = tileAlphaFromColor(tile->color);
++                        tile->hidden = false;
+                     }
+                 } else {
+                     assets->legacyTiles = nullptr;
+@@ -3367,6 +3369,11 @@ void DataWin_freeRoomPayload(Room* room) {
+     room->gameObjectCount = 0;
+     free(room->tiles);
+     room->tiles = nullptr;
++    // The payload is reloaded from data.win next time, so the pristine copy is no longer needed.
++    free(room->pristineTiles);
++    room->pristineTiles = nullptr;
++    room->pristineTileCount = 0;
++    room->pristineTilesSaved = false;
+     room->tileCount = 0;
+     if (room->layerCount != 0 && room->layers != nullptr) {
+         repeat(room->layerCount, j) {
+diff --git a/src/data_win.h b/src/data_win.h
+index 409caa6..68292a3 100644
+--- a/src/data_win.h
++++ b/src/data_win.h
+@@ -603,6 +603,7 @@ typedef struct {
+     float scaleY;
+     uint32_t color;
+     float alpha;
++    bool hidden; // GM:S 1.x tile_set_visible(id, false)
+ } RoomTile;
+ 
+ typedef enum 
+@@ -720,6 +721,12 @@ typedef struct {
+     RoomTile* tiles;
+     uint32_t layerCount;
+     RoomLayer* layers;
++
++    // Copy of the room's tiles as designed, taken on the first initRoom. GM:S 1.x tile_add/tile_delete/tile_layer_*
++    // edit room->tiles at runtime, but a non-persistent room must start from its original tiles on every visit.
++    bool pristineTilesSaved;
++    uint32_t pristineTileCount;
++    RoomTile* pristineTiles;
+ } Room;
+ 
+ typedef struct {
+diff --git a/src/gl/gl_renderer.c b/src/gl/gl_renderer.c
+index b19aece..b049228 100644
+--- a/src/gl/gl_renderer.c
++++ b/src/gl/gl_renderer.c
+@@ -516,7 +516,7 @@ static bool compileProgram(GMLShader* gmlShader, const char* name, const char* v
+     glDeleteShader(vertShaderT);
+     glDeleteShader(fragShaderT);
+     //Texture Set Stage BS has to be done bruh :(
+-    int32_t samplerIndex = 0;
++    int32_t samplerIndex = 2;
+     GLint uniformCount;
+     glGetProgramiv(shaderId, GL_ACTIVE_UNIFORMS, &uniformCount);
+ 
+@@ -541,10 +541,18 @@ static bool compileProgram(GMLShader* gmlShader, const char* name, const char* v
+         gmlShader->uniforms[b].type = type;
+ 
+         if (type == GL_SAMPLER_2D) {
++            // gm_BaseTexture always lives on texture unit 1, the unit every regular draw binds its texture to.
++            // Extra samplers (e.g. a palette set with texture_set_stage) start at unit 2 so ordinary draws never clobber them.
++            int32_t slot;
++            if (strcmp(uniformName, "gm_BaseTexture") == 0) {
++                slot = 1;
++            } else {
++                slot = samplerIndex;
++                samplerIndex += 1;
++            }
+             glUseProgram(shaderId);
+-            glUniform1i(gmlShader->uniforms[b].location, samplerIndex);
+-            gmlShader->uniforms[b].samplerSlot = samplerIndex;
+-            samplerIndex += 1;
++            glUniform1i(gmlShader->uniforms[b].location, slot);
++            gmlShader->uniforms[b].samplerSlot = slot;
+         }
+ 
+         if (strcmp(uniformName, "gm_BaseTexture") == 0)
+diff --git a/src/gl_common/gl_common.c b/src/gl_common/gl_common.c
+index 214131d..f4e9f6b 100644
+--- a/src/gl_common/gl_common.c
++++ b/src/gl_common/gl_common.c
+@@ -318,7 +318,25 @@ void GLCommon_endLetterboxBlit(int32_t fboWidth, int32_t fboHeight, int32_t game
+ 
+ // ===[ Surface arrays ]===
+ 
++static uint32_t appendSurfaceSlot(GLuint** surfaces, GLuint** surfaceTexture, int32_t** surfaceWidth, int32_t** surfaceHeight, uint32_t* count);
++
++// Surface ids follow GameMaker's behaviour:
++//  - id 0 is never a live surface. GML commonly initialises surface variables to 0 and then creates the surface
++//    only when !surface_exists(var); handing out id 0 makes that check pass wrongly (e.g. a title screen's text surface never got drawn).
++//  - ids of freed surfaces are reused, so games that create/free surfaces every frame don't grow the tables forever.
+ uint32_t GLCommon_allocateSurfaceSlot(GLuint** surfaces, GLuint** surfaceTexture, int32_t** surfaceWidth, int32_t** surfaceHeight, uint32_t* count) {
++    if (*count == 0) appendSurfaceSlot(surfaces, surfaceTexture, surfaceWidth, surfaceHeight, count); // reserve id 0
++    for (uint32_t i = 1; *count > i; i++) {
++        if ((*surfaces)[i] == 0 && (*surfaceTexture)[i] == 0) {
++            (*surfaceWidth)[i] = 0;
++            (*surfaceHeight)[i] = 0;
++            return i;
++        }
++    }
++    return appendSurfaceSlot(surfaces, surfaceTexture, surfaceWidth, surfaceHeight, count);
++}
++
++static uint32_t appendSurfaceSlot(GLuint** surfaces, GLuint** surfaceTexture, int32_t** surfaceWidth, int32_t** surfaceHeight, uint32_t* count) {
+     uint32_t newIndex = *count;
+     (*count)++;
+     *surfaces = (GLuint *)safeRealloc(*surfaces, *count * sizeof(GLuint));
+diff --git a/src/json_reader.c b/src/json_reader.c
+index 82f1926..683bc85 100644
+--- a/src/json_reader.c
++++ b/src/json_reader.c
+@@ -1,3 +1,4 @@
++#include <string.h>
+ #include "json_reader.h"
+ 
+ #include "stdio_compat.h"
+@@ -50,6 +51,23 @@ static JsonValue* parseString(JsonParser* parser) {
+     // Skip opening quote
+     advance(parser);
+ 
++    // Fast path: no escape sequences before the closing quote -> copy the whole string in one go.
++    {
++        const char* start = parser->input + parser->position;
++        size_t remaining = parser->length - parser->position;
++        const char* quote = (const char*) memchr(start, '"', remaining);
++        size_t i = quote ? (size_t) (quote - start) : remaining;
++        if (quote != nullptr && memchr(start, '\\', i) == nullptr) {
++            char* buffer = (char *)safeMalloc(i + 1);
++            memcpy(buffer, start, i);
++            buffer[i] = '\0';
++            parser->position += i + 1;
++            JsonValue* value = makeValue(JSON_STRING);
++            value->stringValue = buffer;
++            return value;
++        }
++    }
++
+     size_t capacity = 64;
+     size_t length = 0;
+     char* buffer = (char *)safeMalloc(capacity);
+diff --git a/src/overlay_file_system.c b/src/overlay_file_system.c
+index 0e3d9ae..b9507f1 100644
+--- a/src/overlay_file_system.c
++++ b/src/overlay_file_system.c
+@@ -65,8 +65,30 @@ static bool pathExists(const char* fullPath) {
+ 
+ // Returns a heap-allocated full path for reads. Absolute inputs pass through as-is.
+ // For relative inputs, savePath wins if the file exists there, else bundlePath.
++// If `normalized` points inside the bundle directory (games build paths like `working_directory + "save.txt"`),
++// returns the bundle-relative remainder (a pointer into `normalized`). Paths already inside the save directory return nullptr.
++// GameMaker sandboxes these: writes land in the save area and reads prefer the saved copy, which matters when the bundle
++// is read-only (e.g. romfs:/ on the Switch).
++static const char* bundleRelativePart(OverlayFileSystem* ofs, const char* normalized) {
++    size_t saveLen = strlen(ofs->savePath);
++    size_t bundleLen = strlen(ofs->bundlePath);
++    if (saveLen > 0 && strncmp(normalized, ofs->savePath, saveLen) == 0) return nullptr;
++    if (bundleLen > 0 && strncmp(normalized, ofs->bundlePath, bundleLen) == 0) return normalized + bundleLen;
++    return nullptr;
++}
++
+ static char* resolveForRead(OverlayFileSystem* ofs, const char* relativePath) {
+     char* normalized = normalizePath(relativePath);
++    const char* bundleRel = bundleRelativePart(ofs, normalized);
++    if (bundleRel != nullptr) {
++        char* saveCopy = joinPath(ofs->savePath, bundleRel);
++        if (pathExists(saveCopy)) {
++            free(normalized);
++            return saveCopy;
++        }
++        free(saveCopy);
++        return normalized;
++    }
+     if (isAbsolute(normalized)) return normalized;
+ 
+     // Check if the path is already resolved
+@@ -88,6 +110,12 @@ static char* resolveForRead(OverlayFileSystem* ofs, const char* relativePath) {
+ // For relative inputs, it will always be the save path.
+ static char* resolveForWrite(OverlayFileSystem* ofs, const char* relativePath) {
+     char* normalized = normalizePath(relativePath);
++    const char* bundleRel = bundleRelativePart(ofs, normalized);
++    if (bundleRel != nullptr) {
++        char* full = joinPath(ofs->savePath, bundleRel);
++        free(normalized);
++        return full;
++    }
+     if (isAbsolute(normalized)) return normalized;
+ 
+     // Check if the path is already resolved
+diff --git a/src/runner.c b/src/runner.c
+index c2c2ee0..0edc065 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -671,6 +671,11 @@ typedef struct {
+     int32_t elementOrder;
+ } DrawKey;
+ 
++// GameMaker Studio 1.x draws instances that share a depth newest-first (a new instance goes in front of
++// the older ones in the depth-sorted list, so it ends up drawn BEHIND them). GameMaker 2+ draws newer
++// instances on top. Set once per game in Runner_create (see below).
++static bool sameDepthNewerInstancesBehind = false;
++
+ static DrawKey drawableKey(const Drawable* d) {
+     DrawKey k = { d->depth, d->type, 0, d->layerOrder, d->elementOrder };
+     switch (d->type) {
+@@ -699,8 +704,11 @@ static int compareDrawKeys(const DrawKey* a, const DrawKey* b) {
+     if (a->type == DRAWABLE_TILE)
+         return (a->order > b->order) - (a->order < b->order); // tiles: higher index later
+ 
+-    if (a->type == DRAWABLE_INSTANCE)
+-        return (a->order > b->order) - (a->order < b->order); // instances: newer (higher id) on top
++    if (a->type == DRAWABLE_INSTANCE) {
++        if (sameDepthNewerInstancesBehind)
++            return (a->order < b->order) - (a->order > b->order); // GM:S 1.x: newer (higher id) drawn first, i.e. behind
++        return (a->order > b->order) - (a->order < b->order); // GM 2+: newer (higher id) on top
++    }
+ 
+     return (a->order < b->order) - (a->order > b->order); // layer/particle: higher first
+ }
+@@ -1027,6 +1035,7 @@ void Runner_draw(Runner* runner) {
+                 // Skip tiles whose layer was hidden via tile_layer_hide(). Filtered here (not in the cache) so toggling layer visibility doesn't invalidate.
+                 ptrdiff_t layerIdx = hmgeti(runner->tileLayerMap, tile->tileDepth);
+                 if (layerIdx >= 0 && !runner->tileLayerMap[layerIdx].value.visible) continue;
++                if (tile->hidden) continue; // tile_set_visible(id, false)
+                 float offsetX = 0.0f, offsetY = 0.0f;
+                 if (layerIdx >= 0) {
+                     offsetX = runner->tileLayerMap[layerIdx].value.offsetX;
+@@ -1714,6 +1723,26 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
+ 
+     // === Normal room initialization (first visit, or non-persistent room) ===
+ 
++    // Start from the room's designed tiles: drop tiles added/removed/moved at runtime on an earlier visit.
++    if (!room->pristineTilesSaved) {
++        room->pristineTileCount = room->tileCount;
++        room->pristineTiles = nullptr;
++        if (room->tileCount > 0) {
++            room->pristineTiles = (RoomTile*) safeMalloc(room->tileCount * sizeof(RoomTile));
++            memcpy(room->pristineTiles, room->tiles, room->tileCount * sizeof(RoomTile));
++        }
++        room->pristineTilesSaved = true;
++    } else {
++        free(room->tiles);
++        room->tiles = nullptr;
++        room->tileCount = room->pristineTileCount;
++        if (room->pristineTileCount > 0) {
++            room->tiles = (RoomTile*) safeMalloc(room->pristineTileCount * sizeof(RoomTile));
++            memcpy(room->tiles, room->pristineTiles, room->pristineTileCount * sizeof(RoomTile));
++        }
++    }
++    runner->drawableListStructureDirty = true;
++
+     // Initialize the views and their default cameras from scratch.
+     repeat(MAX_VIEWS, vi) {
+         RoomView* roomView = &room->views[vi];
+@@ -2084,6 +2113,9 @@ static void cleanupState(Runner* runner) {
+     }
+     arrfree(runner->dsMapPool);
+     runner->dsMapPool = nullptr;
++    repeat((int32_t) arrlen(runner->dsMapChildren), i) arrfree(runner->dsMapChildren[i]);
++    arrfree(runner->dsMapChildren);
++    runner->dsMapChildren = nullptr;
+ 
+     {
+     repeat((int32_t) arrlen(runner->dsListPool), i) {
+@@ -2092,10 +2124,12 @@ static void cleanupState(Runner* runner) {
+             RValue_free(&list->items[j]);
+         }
+         arrfree(list->items);
++        arrfree(list->children);
+     }
+     }
+     arrfree(runner->dsListPool);
+     runner->dsListPool = nullptr;
++    runner->dsListFreeHint = 0;
+ 
+     {
+     repeat((int32_t) arrlen(runner->dsQueuePool), i) {
+@@ -2977,6 +3011,14 @@ void Runner_initFirstRoom(Runner* runner) {
+     // primitives if bit 35 is set.  Earlier versions of GameMaker or GameMaker Studio
+     // appear to apply it unconditionally.
+     runner->applyOffsetForPrimitives = !DataWin_isVersionAtLeast(dataWin, 2024, 14, 0, 0) || ((dataWin->optn.info >> 35) & 1);
++    runner->applyOffsetForPoints = runner->applyOffsetForPrimitives;
++    sameDepthNewerInstancesBehind = !DataWin_isVersionAtLeast(dataWin, 2, 0, 0, 0);
++#ifdef BS_EXACT_POINTS
++    // Build option (-DBS_EXACT_POINTS=ON): draw_point/draw_point_colour land exactly on (x, y), as on the original
++    // Windows runner. Needed by games that build palette/lookup textures pixel by pixel with draw_point; with the
++    // usual 1-pixel primitive offset their whole palette shifts by one texel (wrong colours everywhere).
++    runner->applyOffsetForPoints = false;
++#endif
+ 
+     // Run global init scripts with the global scope instance as "self"
+     // In GMS 2.3+ (BC17), GLOB scripts store function declarations on "self" via Pop.v.v
+@@ -4200,7 +4242,33 @@ static void dispatchSpriteMessages(Runner* runner, PendingSpriteMessage* pending
+     }
+ }
+ 
++#ifdef PLATFORM_SWITCH
++void Switch_endLoadingBoost(void); // switch/main.c
++// switch/main.c turns on CPU boost (1785 MHz) for the loading phase. Boost also lowers the GPU clock, so turn it back
++// off once the game has run ~0.5 s of normal-length frames, i.e. once the boot-time data parsing is over.
++static void switchCpuBoostUpdate(void) {
++    static bool done = false;
++    static uint64_t firstNanos = 0;
++    static uint64_t lastNanos = 0;
++    static int fastFrames = 0;
++    if (done) return;
++    uint64_t now = nowNanos();
++    if (firstNanos == 0) firstNanos = now;
++    if (lastNanos != 0 && now - lastNanos < 50000000ull) fastFrames++;
++    else fastFrames = 0;
++    lastNanos = now;
++    // Safety cap: never keep the GPU throttled for more than 20 s of running frames.
++    if (fastFrames >= 30 || now - firstNanos > 20000000000ull) {
++        Switch_endLoadingBoost();
++        done = true;
++    }
++}
++#endif
++
+ void Runner_step(Runner* runner) {
++#ifdef PLATFORM_SWITCH
++    switchCpuBoostUpdate();
++#endif
+     runner->fpsRealFrameStartNanos = nowNanos();
+ 
+     // The snapshot arena is stack-like and every push must be matched with a pop within the same frame. Assert that invariant at the top of each step: a non-zero length here means some site below pushed without popping, and we want a loud failure with the offending length so we can find it instead of silently leaking until the next frame.
+@@ -5026,7 +5094,7 @@ char* Runner_dumpStateJson(Runner* runner) {
+         JsonWriter_propertyInt(&w, "color", tile->color);
+ 
+         ptrdiff_t layerIdx = hmgeti(runner->tileLayerMap, tile->tileDepth);
+-        bool visible = (layerIdx >= 0) ? runner->tileLayerMap[layerIdx].value.visible : true;
++        bool visible = ((layerIdx >= 0) ? runner->tileLayerMap[layerIdx].value.visible : true) && !tile->hidden;
+         JsonWriter_propertyBool(&w, "visible", visible);
+         JsonWriter_endObject(&w);
+     }
+diff --git a/src/runner.h b/src/runner.h
+index a00dfc5..360ca50 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -303,10 +303,20 @@ typedef struct {
+     RValue item;
+ } DsPriorityItem;
+ 
++// A nested ds_map/ds_list owned by a parent (from json_decode or ds_map_add_map/ds_map_add_list).
++// GameMaker destroys these together with the parent.
++typedef struct {
++    int32_t type; // DS_TYPE_MAP or DS_TYPE_LIST
++    int32_t id;
++    uint32_t generation; // list slot generation when recorded (list ids are reused)
++} DsChildRef;
++
+ // ds_list: dynamic array of RValues
+ typedef struct {
+     RValue* items; // stb_ds dynamic array of RValues
+     bool freed;    // true when the slot is destroyed and available for reuse by ds_list_create (matches native GMS)
++    uint32_t generation; // bumped every time the slot is reused
++    DsChildRef* children; // stb_ds array: nested containers destroyed with this list
+ } DsList;
+ 
+ // ds_queue: FIFO, items[0] is the head (next to dequeue), last item is the tail.
+@@ -777,6 +787,8 @@ struct Runner {
+     bool drawEnabled;
+     bool forceDrawDepth;
+     bool applyOffsetForPrimitives;
++    // Some GM:S 1.4 games build palette textures with draw_point and need points to land exactly on (x, y) (see BS_EXACT_POINTS).
++    bool applyOffsetForPoints;
+     // Depth-sorted unified list of all drawables (instances + tiles + runtime layers) for the current room.
+     // Active/visible filtering happens at draw time, so toggling those flags does not invalidate the cache.
+     //
+@@ -805,7 +817,9 @@ struct Runner {
+ 
+     // ===[ Builtin function state ]===
+     DsMapEntry** dsMapPool; // stb_ds array of stb_ds hashmaps
++    DsChildRef** dsMapChildren; // stb_ds array parallel to dsMapPool: nested containers destroyed with each map
+     DsList* dsListPool; // stb_ds array of DsList
++    int32_t dsListFreeHint; // no freed ds_list slot exists below this index (keeps ds_list_create from rescanning live lists)
+     DsQueue* dsQueuePool; // stb_ds array of DsQueue
+     DsStack* dsStackPool; // stb_ds array of DsStack
+     DsPriority* dsPriorityPool; // stb_ds array of DsPriority
+diff --git a/src/switch/main.c b/src/switch/main.c
+index 9b4d009..a3b3718 100644
+--- a/src/switch/main.c
++++ b/src/switch/main.c
+@@ -12,11 +12,26 @@
+ #include <SDL3/SDL_main.h>
+ #endif
+ 
++// Folder on the SD card for saves (and for data.win when it isn't bundled in romfs).
++// Override at build time with -DBS_SWITCH_APP_DIR=\"sdmc:/switch/MyGame\"
++#ifndef BS_SWITCH_APP_DIR
++#define BS_SWITCH_APP_DIR "sdmc:/switch/butterscotch"
++#endif
++
++// Called from runner.c once loading is over: back to normal clocks (boost mode also throttles the GPU).
++void Switch_endLoadingBoost(void) {
++    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
++}
++
+ int main(int argc, char* argv[]) {
+     (void)argc;
+     setbuf(stdout, NULL);
+     setbuf(stderr, NULL);
+ 
++    // Run the CPU at full speed (1785 MHz) while the game loads its data at boot, like official games do on
++    // loading screens. runner.c switches this back to normal once frames run at normal speed. Ignored where unsupported.
++    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
++
+     fsdevMountSdmc();
+ 
+     bool hasDataWinInRomfs = false;
+@@ -43,8 +58,11 @@ int main(int argc, char* argv[]) {
+ #else
+     args.renderer = SOFTWARE;
+ #endif
+-    args.dataWinPath = hasDataWinInRomfs ? "romfs:/data.win" : "sdmc:/switch/butterscotch/data.win";
+-    args.saveFolder = "sdmc:/switch/butterscotch";
++    args.dataWinPath = hasDataWinInRomfs ? "romfs:/data.win" : BS_SWITCH_APP_DIR "/data.win";
++    args.saveFolder = BS_SWITCH_APP_DIR;
++    // Decode audio entries on first use instead of reading whole audio groups into RAM at boot
++    // (big soundtracks would otherwise blow the homebrew memory budget and slow startup).
++    args.lazyAudio = true;
+ 
+     int ret = loop(args, argv[0]);
+     freeCommandLineArgs(&args);
+diff --git a/src/switch/switch_input.c b/src/switch/switch_input.c
+index ece5f96..67d9fe6 100644
+--- a/src/switch/switch_input.c
++++ b/src/switch/switch_input.c
+@@ -19,6 +19,10 @@ static void mapLibnxToGml(GamepadSlot* slot, PadState* pad, u64 cur) {
+     if (cur & HidNpadButton_R) slot->buttonDown[5] = true;
+     slot->buttonValue[6] = (cur & HidNpadButton_ZL) ? 1.0f : 0.0f;
+     slot->buttonValue[7] = (cur & HidNpadButton_ZR) ? 1.0f : 0.0f;
++    // ZL/ZR are digital on Switch controllers; report them as held too (gp_shoulderlb / gp_shoulderrb),
++    // like the SDL/GLFW backends do once a trigger passes its threshold.
++    if (cur & HidNpadButton_ZL) slot->buttonDown[6] = true;
++    if (cur & HidNpadButton_ZR) slot->buttonDown[7] = true;
+     if (cur & HidNpadButton_Minus) slot->buttonDown[8] = true;
+     if (cur & HidNpadButton_Plus) slot->buttonDown[9] = true;
+     if (cur & HidNpadButton_StickL) slot->buttonDown[10] = true;
+diff --git a/src/vm.c b/src/vm.c
+index 625c152..5fccf42 100644
+--- a/src/vm.c
++++ b/src/vm.c
+@@ -1631,11 +1631,34 @@ static void handleMod(VMContext* ctx, uint32_t instr) {
+     stackPushTyped(ctx, RValue_makeReal(result), instrType2(instr));
+ }
+ 
++// GameMaker performs bitwise operations on 64-bit integers (e.g. `x & $FFFFFFFF` on a negative x yields a
++// large positive value). Compute in int64 and only narrow back to int32 when the result fits, so that
++// existing int32-typed code paths keep behaving the same.
++static inline void pushBitwiseResult(VMContext* ctx, int64_t result, uint32_t instr) {
++    if (result >= INT32_MIN && result <= INT32_MAX) {
++        stackPushTyped(ctx, RValue_makeInt32((int32_t) result), instrType2(instr));
++    } else {
++        stackPushTyped(ctx, RValue_makeInt64(result), instrType2(instr));
++    }
++}
++
++static inline int64_t stackPopInt64Value(VMContext* ctx) {
++    assert(ctx->stack.top > 0);
++    RValue rvalue = ctx->stack.slots[--ctx->stack.top];
++    int64_t v = RValue_toInt64(rvalue);
++    RValue_free(&rvalue);
++    return v;
++}
++
+ #define SIMPLE_BYTECODE_BITWISE_OPERATION(op) \
+-    int32_t b = stackPopInt32(ctx); \
+-    int32_t a = stackPopInt32(ctx); \
+-    int32_t result = a op b; \
+-    stackPushTyped(ctx, RValue_makeInt32(result), instrType2(instr))
++    int64_t b = stackPopInt64Value(ctx); \
++    int64_t a = stackPopInt64Value(ctx); \
++    pushBitwiseResult(ctx, a op b, instr)
++
++#define SHIFT_BYTECODE_BITWISE_OPERATION(op) \
++    int64_t b = stackPopInt64Value(ctx); \
++    int64_t a = stackPopInt64Value(ctx); \
++    pushBitwiseResult(ctx, (b < 0 || b > 63) ? (int64_t) 0 : (int64_t) ((uint64_t) a op b), instr)
+ 
+ static void handleAnd(VMContext* ctx, uint32_t instr) {
+     SIMPLE_BYTECODE_BITWISE_OPERATION(&);
+@@ -1658,24 +1681,36 @@ static void handleNeg(VMContext* ctx, uint32_t instr) {
+ 
+ static void handleNot(VMContext* ctx, uint32_t instr) {
+     uint8_t resultType = instrType1(instr);
+-    int32_t a = stackPopInt32(ctx);
++    assert(ctx->stack.top > 0);
++    RValue value = ctx->stack.slots[--ctx->stack.top];
+     if (GML_TYPE_BOOL == resultType) {
+-        // Logical NOT: compiler emits this for the ! operator on boolean expressions
+-        int32_t result = (a == 0) ? 1 : 0;
+-        stackPushTyped(ctx, RValue_makeBool(result != 0), resultType);
++        // Logical NOT: compiler emits this for the ! operator on boolean expressions.
++        // Uses GameMaker truthiness (true only when > 0.5), so !-1 is true.
++        bool result = !RValue_toBool(value);
++        RValue_free(&value);
++        stackPushTyped(ctx, RValue_makeBool(result), resultType);
+     } else {
+-        // Bitwise NOT: used for ~ operator on integer types
+-        int32_t result = ~a;
+-        stackPushTyped(ctx, RValue_makeInt32(result), resultType);
++        // Bitwise NOT: used for ~ operator on integer types (64-bit in GameMaker)
++        int64_t a = RValue_toInt64(value);
++        RValue_free(&value);
++        int64_t result = ~a;
++        if (result >= INT32_MIN && result <= INT32_MAX) {
++            stackPushTyped(ctx, RValue_makeInt32((int32_t) result), resultType);
++        } else {
++            stackPushTyped(ctx, RValue_makeInt64(result), resultType);
++        }
+     }
+ }
+ 
+ static void handleShl(VMContext* ctx, uint32_t instr) {
+-    SIMPLE_BYTECODE_BITWISE_OPERATION(<<);
++    SHIFT_BYTECODE_BITWISE_OPERATION(<<);
+ }
+ 
+ static void handleShr(VMContext* ctx, uint32_t instr) {
+-    SIMPLE_BYTECODE_BITWISE_OPERATION(>>);
++    int64_t b = stackPopInt64Value(ctx);
++    int64_t a = stackPopInt64Value(ctx);
++    // Arithmetic shift right, like GameMaker (negative numbers stay negative).
++    pushBitwiseResult(ctx, (b < 0) ? a : (b > 63 ? (a < 0 ? -1 : 0) : (a >> b)), instr);
+ }
+ 
+ static void handleConv(VMContext* ctx, uint8_t srcType, uint8_t dstType, uint8_t convKey) {
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index 314c7bf..6e82c07 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -32,6 +32,9 @@
+ #include "collision.h"
+ #include "ini.h"
+ #include "audio_system.h"
++#ifndef SOUND_INSTANCE_ID_BASE
++#define SOUND_INSTANCE_ID_BASE 100000 // matches the OpenAL and miniaudio backends
++#endif
+ #include "file_system.h"
+ #include "md5.h"
+ #include "sha1.h"
+@@ -160,13 +163,18 @@ static int32_t dsListCreate(Runner* runner) {
+     // Reuse a freed slot if available, matching native GameMaker behavior.
+     // Yes, some games (example: DELTARUNE Chapter 3's obj_board_playercamera_Other_10) rely on ds_list_create reusing the id of a list just destroyed.
+     int32_t poolSize = (int32_t) arrlen(runner->dsListPool);
+-    repeat(poolSize, i) {
++    if (0 > runner->dsListFreeHint) runner->dsListFreeHint = 0;
++    for (int32_t i = runner->dsListFreeHint; poolSize > i; i++) {
+         if (runner->dsListPool[i].freed) {
++            runner->dsListFreeHint = i + 1;
+             runner->dsListPool[i].freed = false;
+             runner->dsListPool[i].items = nullptr;
++            runner->dsListPool[i].generation++;
++            runner->dsListPool[i].children = nullptr;
+             return i;
+         }
+     }
++    runner->dsListFreeHint = poolSize + 1;
+     DsList newList = {0};
+     int32_t id = poolSize;
+     arrput(runner->dsListPool, newList);
+@@ -179,6 +187,61 @@ static DsList* dsListGet(Runner* runner, int32_t id) {
+     return &runner->dsListPool[id];
+ }
+ 
++// ===[ Nested (owned) containers ]===
++// GameMaker destroys maps/lists nested by json_decode or ds_map_add_map/ds_map_add_list together with their parent.
++static void dsAddChild(Runner* runner, int32_t parentType, int32_t parentId, int32_t childType, int32_t childId) {
++    if (0 > childId) return;
++    DsChildRef ref = { childType, childId, 0 };
++    if (childType == DS_TYPE_LIST) {
++        DsList* child = dsListGet(runner, childId);
++        if (child == nullptr) return;
++        ref.generation = child->generation;
++    } else if (childType == DS_TYPE_MAP) {
++        if (childId >= (int32_t) arrlen(runner->dsMapPool)) return;
++    } else {
++        return;
++    }
++    if (parentType == DS_TYPE_LIST) {
++        DsList* parent = dsListGet(runner, parentId);
++        if (parent != nullptr) arrput(parent->children, ref);
++    } else if (parentType == DS_TYPE_MAP) {
++        if (0 > parentId || parentId >= (int32_t) arrlen(runner->dsMapPool)) return;
++        while ((int32_t) arrlen(runner->dsMapChildren) <= parentId) arrput(runner->dsMapChildren, (DsChildRef*) nullptr);
++        arrput(runner->dsMapChildren[parentId], ref);
++    }
++}
++
++static void dsMapDestroyId(Runner* runner, int32_t id);
++static void dsListDestroyId(Runner* runner, int32_t id);
++
++static void dsDestroyChildren(Runner* runner, DsChildRef* children) {
++    repeat(arrlen(children), i) {
++        DsChildRef* c = &children[i];
++        if (c->type == DS_TYPE_MAP) {
++            dsMapDestroyId(runner, c->id);
++        } else if (c->type == DS_TYPE_LIST) {
++            DsList* l = dsListGet(runner, c->id);
++            if (l != nullptr && l->generation == c->generation) dsListDestroyId(runner, c->id);
++        }
++    }
++    arrfree(children);
++}
++
++static void dsListDestroyId(Runner* runner, int32_t id) {
++    DsList* list = dsListGet(runner, id);
++    if (list == nullptr) return;
++    repeat(arrlen(list->items), i) {
++        RValue_free(&list->items[i]);
++    }
++    arrfree(list->items);
++    list->items = nullptr;
++    list->freed = true;
++    if (runner->dsListFreeHint > id) runner->dsListFreeHint = id;
++    DsChildRef* children = list->children;
++    list->children = nullptr;
++    dsDestroyChildren(runner, children); // may grow dsListPool, so `list` is not used after this
++}
++
+ // ===[ DS_QUEUE SYSTEM ]===
+ 
+ static int32_t dsQueueCreate(Runner* runner) {
+@@ -283,6 +346,8 @@ static const BuiltinVarEntry BUILTIN_VAR_TABLE[] = {
+     { "background_height", BUILTIN_VAR_BACKGROUND_HEIGHT },
+     { "background_hspeed", BUILTIN_VAR_BACKGROUND_HSPEED },
+     { "background_index", BUILTIN_VAR_BACKGROUND_INDEX },
++    { "background_showcolor", BUILTIN_VAR_BACKGROUND_SHOWCOLOR },
++    { "background_showcolour", BUILTIN_VAR_BACKGROUND_SHOWCOLOUR },
+     { "background_visible", BUILTIN_VAR_BACKGROUND_VISIBLE },
+     { "background_vspeed", BUILTIN_VAR_BACKGROUND_VSPEED },
+     { "background_width", BUILTIN_VAR_BACKGROUND_WIDTH },
+@@ -1073,6 +1138,10 @@ RValue VMBuiltins_getVariable(VMContext* ctx, Instance* inst, int16_t builtinVar
+         case BUILTIN_VAR_BACKGROUND_COLOR:
+         case BUILTIN_VAR_BACKGROUND_COLOUR:
+             return RValue_makeReal((GMLReal) runner->backgroundColor);
++        // GM:S 1.x: whether the room's background colour is drawn
++        case BUILTIN_VAR_BACKGROUND_SHOWCOLOR:
++        case BUILTIN_VAR_BACKGROUND_SHOWCOLOUR:
++            return RValue_makeBool(runner->drawBackgroundColor);
+ 
+         // Timing
+         case BUILTIN_VAR_CURRENT_DAY:
+@@ -1753,6 +1822,10 @@ void VMBuiltins_setVariable(VMContext* ctx, Instance* inst, int16_t builtinVarId
+         case BUILTIN_VAR_BACKGROUND_COLOUR:
+             runner->backgroundColor = RValue_toColour(val);
+             return;
++        case BUILTIN_VAR_BACKGROUND_SHOWCOLOR:
++        case BUILTIN_VAR_BACKGROUND_SHOWCOLOUR:
++            runner->drawBackgroundColor = RValue_toBool(val);
++            return;
+ 
+         // Room properties
+         case BUILTIN_VAR_ROOM:
+@@ -1784,9 +1857,8 @@ void VMBuiltins_setVariable(VMContext* ctx, Instance* inst, int16_t builtinVarId
+ 
+         // argument[N] - array-style write to script arguments
+         case BUILTIN_VAR_ARGUMENT:
++            // argument[N] = val replaces script argument N (GMS 1.4 allows assigning to arguments).
+             if (arrayIndex >= 0) {
+-                VM_writeToScriptArgsArrayElement(ctx, arrayIndex, arrayIndex, val);
+-            } else {
+                 VM_writeToScriptArgs(ctx, arrayIndex, val);
+             }
+             return;
+@@ -3499,11 +3571,15 @@ static RValue builtin_matrix_build_lookat(MAYBE_UNUSED VMContext *ctx, RValue *a
+ // ===[ RANDOM FUNCTIONS ]===
+ 
+ 
++// Last seed handed to the RNG, for random_get_seed().
++static uint32_t g_lastRandomSeed = 0;
++
+ static RValue builtin_random_set_seed(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("random_set_seed", 1, RValue_makeReal(0.0));
+     GMLReal seed = RValue_toReal(args[0]);
+     bool fixRangeBug = RValue_toBool(args[1]); 
+     Random_setSeed(&ctx->runner->random, (uint32_t) seed);
++    g_lastRandomSeed = (uint32_t) seed;
+     (void) fixRangeBug; // do we even need to do anything with this?
+     return RValue_makeUndefined();
+ }
+@@ -3557,7 +3633,8 @@ static RValue builtin_randomize(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE
+      * is used as the source. we divide by 1000 to improve entropy on such systems.
+      * 2654435761u = Knuth's multiplier.
+      */
+-    Random_setSeed(&ctx->runner->random, (uint32_t)(nowNanos() / 1000) * 2654435761u);
++    g_lastRandomSeed = (uint32_t)(nowNanos() / 1000) * 2654435761u;
++    Random_setSeed(&ctx->runner->random, g_lastRandomSeed);
+     return RValue_makeUndefined();
+ }
+ 
+@@ -4878,6 +4955,7 @@ static RValue dsMapAddCommon(VMContext* ctx, RValue* args, int32_t argCount, boo
+         // Wrap the value (ds_map or ds_list ID) in a container struct
+         int32_t containedId = RValue_toInt32(args[2]);
+         valueToStore = makeMapListContainer(ctx, containedId, containerType);
++        dsAddChild(runner, DS_TYPE_MAP, id, containerType, containedId);
+     } else {
+         // Store the value directly
+         valueToStore = RValue_makeIndependent(args[2]);
+@@ -5123,9 +5201,13 @@ static RValue builtin_ds_map_delete(VMContext* ctx, RValue* args, int32_t argCou
+ static RValue builtin_ds_map_destroy(VMContext* ctx, RValue* args, int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("ds_map_destroy", 1, RValue_makeUndefined());
+     Runner* runner = ctx->runner;
+-    int32_t id = RValue_toInt32(args[0]);
++    dsMapDestroyId(runner, RValue_toInt32(args[0]));
++    return RValue_makeUndefined();
++}
++
++static void dsMapDestroyId(Runner* runner, int32_t id) {
+     DsMapEntry** mapPtr = dsMapGet(runner, id);
+-    if (mapPtr == nullptr) return RValue_makeUndefined();
++    if (mapPtr == nullptr) return;
+     // Free all keys and values
+     for (ptrdiff_t i = 0; shlen(*mapPtr) > i; i++) {
+         free((*mapPtr)[i].key);
+@@ -5133,7 +5215,11 @@ static RValue builtin_ds_map_destroy(VMContext* ctx, RValue* args, int32_t argCo
+     }
+     shfree(*mapPtr);
+     *mapPtr = nullptr;
+-    return RValue_makeUndefined();
++    if (id < (int32_t) arrlen(runner->dsMapChildren)) {
++        DsChildRef* children = runner->dsMapChildren[id];
++        runner->dsMapChildren[id] = nullptr;
++        dsDestroyChildren(runner, children);
++    }
+ }
+ 
+ static RValue builtin_ds_map_copy(VMContext* ctx, RValue* args, int32_t argCount) {
+@@ -5211,16 +5297,19 @@ static RValue builtin_ds_list_add(VMContext* ctx, RValue* args, int32_t argCount
+ }
+ 
+ static RValue builtin_ds_list_set(VMContext* ctx, RValue* args, int32_t argCount) {
+-    REQUIRE_ARGC_AT_LEAST("ds_list_set", 1, RValue_makeUndefined());
+-    REQUIRE_ARGC_AT_MOST("ds_list_set", 2, RValue_makeUndefined());
++    REQUIRE_ARGC_AT_LEAST("ds_list_set", 3, RValue_makeUndefined());
++    REQUIRE_ARGC_AT_MOST("ds_list_set", 3, RValue_makeUndefined());
+     Runner* runner = ctx->runner;
+     int32_t id = RValue_toInt32(args[0]);
+     int32_t pos = RValue_toInt32(args[1]);
+     DsList* list = dsListGet(runner, id);
+-    if (list == nullptr) return RValue_makeUndefined();
+-    if (pos >= 0 && pos < arrlen(list->items)) {
+-        list->items[pos] = RValue_makeIndependent(args[2]);
++    if (list == nullptr || pos < 0) return RValue_makeUndefined();
++    // Setting past the end grows the list, padding with 0 (GameMaker behaviour).
++    while (pos >= arrlen(list->items)) {
++        arrput(list->items, RValue_makeReal(0.0));
+     }
++    RValue_free(&list->items[pos]);
++    list->items[pos] = RValue_makeIndependent(args[2]);
+     return RValue_makeUndefined();
+ }
+ 
+@@ -5308,16 +5397,7 @@ static RValue builtin_ds_list_empty(VMContext* ctx, RValue* args, MAYBE_UNUSED i
+ }
+ 
+ static RValue builtin_ds_list_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+-    Runner* runner = ctx->runner;
+-    int32_t id = RValue_toInt32(args[0]);
+-    DsList* list = dsListGet(runner, id);
+-    if (list == nullptr) return RValue_makeUndefined();
+-    repeat(arrlen(list->items), i) {
+-        RValue_free(&list->items[i]);
+-    }
+-    arrfree(list->items);
+-    list->items = nullptr;
+-    list->freed = true;
++    dsListDestroyId(ctx->runner, RValue_toInt32(args[0]));
+     return RValue_makeUndefined();
+ }
+ 
+@@ -5339,14 +5419,35 @@ static RValue builtin_ds_list_size(VMContext* ctx, RValue* args, MAYBE_UNUSED in
+     return RValue_makeReal((GMLReal) arrlen(list->items));
+ }
+ 
++static inline bool dsValueIsNumber(RValue v) {
++    switch (v.type) {
++        case RVALUE_REAL:
++        case RVALUE_INT32:
++        case RVALUE_BOOL:
++#ifndef NO_RVALUE_INT64
++        case RVALUE_INT64:
++#endif
++            return true;
++        default:
++            return false;
++    }
++}
++
+ static RValue builtin_ds_list_find_index(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+     Runner* runner = ctx->runner;
+     int32_t id = RValue_toInt32(args[0]);
+     DsList* list = dsListGet(runner, id);
+     if (list == nullptr) return RValue_makeReal(-1.0);
+     RValue needle = args[1];
++    bool needleIsNumber = dsValueIsNumber(needle);
++    GMLReal needleNumber = needleIsNumber ? RValue_toReal(needle) : 0;
+     for (int32_t i = 0; (int32_t) arrlen(list->items) > i; i++) {
+         RValue item = list->items[i];
++        // GML compares numbers by value, whatever their internal type (e.g. int32 37 == real 37.0).
++        if (needleIsNumber && dsValueIsNumber(item)) {
++            if (RValue_toReal(item) == needleNumber) return RValue_makeReal((GMLReal) i);
++            continue;
++        }
+         if (item.type != needle.type) continue;
+         switch (item.type) {
+             case RVALUE_REAL:
+@@ -5653,6 +5754,19 @@ static void dsStreamWriteValue(uint8_t** buf, RValue val) {
+     }
+ }
+ 
++// Same as dsStreamWriteValue, but arrays use the GM:S 1.x (magic 602) layout: [1 row][length][values...].
++static void dsStreamWriteValueLegacy(uint8_t** buf, RValue val) {
++    if (val.type != RVALUE_ARRAY) { dsStreamWriteValue(buf, val); return; }
++    int32_t len = GMLArray_length1D(val.array);
++    dsStreamAppendU32(buf, DS_STREAM_VALUE_ARRAY);
++    dsStreamAppendU32(buf, 1);
++    dsStreamAppendU32(buf, (uint32_t) len);
++    repeat(len, k) {
++        RValue* slot = GMLArray_slot(val.array, k);
++        dsStreamWriteValueLegacy(buf, slot != nullptr ? *slot : RValue_makeUndefined());
++    }
++}
++
+ // Appends each RValue in `items` (length `len`) to `buf` using the ds wire format.
+ static void dsStreamAppendValues(uint8_t** buf, const RValue* items, int32_t len) {
+     repeat(len, i) {
+@@ -5904,16 +6018,28 @@ static RValue builtin_ds_grid_copy(VMContext* ctx, RValue* args, MAYBE_UNUSED in
+ static RValue jsonDecodeValue(VMContext* ctx, JsonValue* json);
+ 
+ static uint8_t* dsHexDecode(const char* hex, int32_t* outLen) {
++    // Table indexed by two hex characters at once (0xFFFF = invalid pair), built once (128 KB).
++    static uint16_t* pairTable = nullptr;
++    if (pairTable == nullptr) {
++        pairTable = (uint16_t*) safeMalloc(65536 * sizeof(uint16_t));
++        repeat(65536, idx) {
++            int hi = dsHexNibble((char) (idx & 0xFF));
++            int lo = dsHexNibble((char) (idx >> 8));
++            pairTable[idx] = (hi < 0 || lo < 0) ? 0xFFFF : (uint16_t) ((hi << 4) | lo);
++        }
++    }
+     int32_t hexLen = (int32_t) strlen(hex);
+     if (2 > hexLen || (hexLen & 1) != 0) return nullptr;
+     int32_t byteLen = hexLen / 2;
+     uint8_t* bytes = (uint8_t *)safeMalloc((size_t) byteLen);
++    const uint8_t* in = (const uint8_t*) hex;
++    uint16_t bad = 0;
+     repeat(byteLen, i) {
+-        int hi = dsHexNibble(hex[i * 2]);
+-        int lo = dsHexNibble(hex[i * 2 + 1]);
+-        if (hi < 0 || lo < 0) { free(bytes); return nullptr; }
+-        bytes[i] = (uint8_t) ((hi << 4) | lo);
++        uint16_t v = pairTable[(uint32_t) in[i * 2] | ((uint32_t) in[i * 2 + 1] << 8)];
++        bad |= v;
++        bytes[i] = (uint8_t) v;
+     }
++    if (bad & 0xFF00) { free(bytes); return nullptr; }
+     *outLen = byteLen;
+     return bytes;
+ }
+@@ -6012,6 +6138,9 @@ static RValue dsGridReadNative(VMContext* ctx, DsGrid* grid, const char* hex) {
+     if (magic == 602) version = 3;
+     else if (magic == 603) version = 0;
+     else { free(bytes); return RValue_makeBool(false); }
++    // The GM:S 1.x runner serialises grids column by column (x outer, y inner). For GM:S 1.x games, grids written by
++    // older Butterscotch builds used magic 603 in row order, so those keep being read the old way.
++    bool columnMajor = (magic == 602) && !IS_WAD17_OR_HIGHER(ctx);
+ 
+     int32_t width = dsStreamReadS32(&s);
+     int32_t height = dsStreamReadS32(&s);
+@@ -6022,11 +6151,13 @@ static RValue dsGridReadNative(VMContext* ctx, DsGrid* grid, const char* hex) {
+ 
+     size_t i = 0;
+     for (i = 0; count > i && !s.error; i++) {
+-        items[i] = dsStreamReadValue(ctx->dataWin, &s, version);
++        size_t dst = i;
++        if (columnMajor && height > 0) dst = (i / (size_t) height) + (i % (size_t) height) * (size_t) width;
++        items[dst] = dsStreamReadValue(ctx->dataWin, &s, version);
+     }
+ 
+     if (s.error) {
+-        for (size_t j = 0; count > j && j <= i; j++) {
++        for (size_t j = 0; count > j; j++) {
+             RValue_free(&items[j]);
+         }
+         free(items);
+@@ -6125,6 +6256,18 @@ static RValue builtin_ds_grid_write(VMContext* ctx, RValue* args, MAYBE_UNUSED i
+     if (grid == nullptr) return RValue_makeOwnedString(safeStrdup(""));
+ 
+     uint8_t* buf = nullptr;
++    if (!IS_WAD17_OR_HIGHER(ctx)) {
++        // GM:S 1.x format: magic 602, column by column (x outer, y inner), legacy array layout.
++        dsStreamAppendU32(&buf, 602);
++        dsStreamAppendU32(&buf, (uint32_t) grid->width);
++        dsStreamAppendU32(&buf, (uint32_t) grid->height);
++        for (int32_t x = 0; grid->width > x; x++) {
++            for (int32_t y = 0; grid->height > y; y++) {
++                dsStreamWriteValueLegacy(&buf, grid->items[x + y * grid->width]);
++            }
++        }
++        return dsStreamFinishToHexString(buf);
++    }
+     dsStreamAppendU32(&buf, 603);
+     dsStreamAppendU32(&buf, (uint32_t) grid->width);
+     dsStreamAppendU32(&buf, (uint32_t) grid->height);
+@@ -7811,10 +7954,15 @@ static RValue builtin_audio_get_name(VMContext* ctx, RValue* args, MAYBE_UNUSED
+ 
+     int32_t soundIndex = RValue_toInt32(args[0]);
+     if (0 > soundIndex) return RValue_makeString("<undefined>");
++    // GameMaker also accepts a playing sound instance id here and returns its asset's name.
++    if (soundIndex >= SOUND_INSTANCE_ID_BASE && audio->vtable->getInstanceSoundIndex != nullptr) {
++        soundIndex = audio->vtable->getInstanceSoundIndex(audio, soundIndex);
++        if (0 > soundIndex) return RValue_makeString("<undefined>");
++    }
+ 
+     repeat(arrlen(audio->audioGroups), i) {
+         DataWin* dw = audio->audioGroups[i];
+-        if (dw->sond.count <= (uint32_t) soundIndex) {
++        if (dw == nullptr || dw->sond.count <= (uint32_t) soundIndex) {
+             continue;
+         } else {
+             return RValue_makeString(dw->sond.sounds[soundIndex].name);
+@@ -8643,11 +8791,15 @@ static RValue builtin_file_text_read_string(VMContext* ctx, RValue* args, int32_
+ 
+     // Read until newline, carriage return, or EOF (does NOT consume the newline)
+     int32_t start = file->readPos;
+-    while (file->contentLen > file->readPos) {
+-        char c = file->content[file->readPos];
+-        if (TextUtils_isNewlineChar(c))
+-            break;
+-        file->readPos++;
++    {
++        // memchr is much faster than a byte loop; the game reads some very long lines at boot.
++        const char* base = file->content + start;
++        size_t avail = (size_t) (file->contentLen - start);
++        const char* nl = (const char*) memchr(base, '\n', avail);
++        size_t lineLen = nl ? (size_t) (nl - base) : avail;
++        const char* cr = (const char*) memchr(base, '\r', lineLen);
++        if (cr) lineLen = (size_t) (cr - base);
++        file->readPos = start + (int32_t) lineLen;
+     }
+ 
+     int32_t len = file->readPos - start;
+@@ -12064,6 +12216,22 @@ static RValue builtin_draw_background_tiled_ext(VMContext* ctx, RValue* args, MA
+     return RValue_makeUndefined();
+ }
+ 
++static RValue builtin_background_exists(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("background_exists", 1, RValue_makeBool(false));
++    if (args[0].type == RVALUE_UNDEFINED) return RValue_makeBool(false);
++    int32_t idx = RValue_toInt32(args[0]);
++    DataWin* dw = ctx->dataWin;
++    return RValue_makeBool(idx >= 0 && (uint32_t) idx < dw->bgnd.count && dw->bgnd.backgrounds[idx].present);
++}
++
++static RValue builtin_background_get_name(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("background_get_name", 1, RValue_makeString("<undefined>"));
++    int32_t idx = RValue_toInt32(args[0]);
++    DataWin* dw = ctx->dataWin;
++    if (0 > idx || (uint32_t) idx >= dw->bgnd.count || dw->bgnd.backgrounds[idx].name == nullptr) return RValue_makeString("<undefined>");
++    return RValue_makeString(dw->bgnd.backgrounds[idx].name);
++}
++
+ static RValue builtin_background_get_width(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("background_get_width", 1, RValue_makeReal(0.0));
+     int32_t bgIndex = RValue_toInt32(args[0]);
+@@ -12100,7 +12268,7 @@ static RValue builtin_draw_point(VMContext* ctx, RValue* args, MAYBE_UNUSED int3
+     if (runner->renderer == nullptr) return RValue_makeUndefined();
+     float x = (float) RValue_toReal(args[0]);
+     float y = (float) RValue_toReal(args[1]);
+-    if (runner->applyOffsetForPrimitives) { x += 1.0f; y += 1.0f; }
++    if (runner->applyOffsetForPoints) { x += 1.0f; y += 1.0f; }
+     runner->renderer->vtable->drawRectangle(runner->renderer, x, y, x + 1.0f, y + 1.0f,
+         runner->renderer->drawColor, runner->renderer->drawAlpha, false);
+     return RValue_makeUndefined();
+@@ -12113,7 +12281,7 @@ static RValue builtin_draw_point_color(VMContext* ctx, RValue* args, MAYBE_UNUSE
+     float x = (float) RValue_toReal(args[0]);
+     float y = (float) RValue_toReal(args[1]);
+     uint32_t col = RValue_toColour(args[2]);
+-    if (runner->applyOffsetForPrimitives) { x += 1.0f; y += 1.0f; }
++    if (runner->applyOffsetForPoints) { x += 1.0f; y += 1.0f; }
+     runner->renderer->vtable->drawRectangle(runner->renderer, x, y, x + 1.0f, y + 1.0f,
+         col, runner->renderer->drawAlpha, false);
+     return RValue_makeUndefined();
+@@ -15238,9 +15406,18 @@ static RValue builtin_tile_layer_shift(MAYBE_UNUSED VMContext* ctx, RValue* args
+     int32_t depth = RValue_toInt32(args[0]);
+     float dx = (float) RValue_toReal(args[1]);
+     float dy = (float) RValue_toReal(args[2]);
+-    TileLayerState* layer = getOrCreateTileLayer(runner, depth);
+-    layer->offsetX += dx;
+-    layer->offsetY += dy;
++    // GM:S 1.x moves the tiles themselves (tile_get_x/y report the new positions, and tiles added afterwards are not
++    // affected). Some games scroll a map this way and then add edge tiles at already-shifted coordinates.
++    Room* room = runner->currentRoom;
++    if (room == nullptr) return RValue_makeUndefined();
++    int32_t ix = (int32_t) lroundf(dx);
++    int32_t iy = (int32_t) lroundf(dy);
++    repeat(room->tileCount, i) {
++        RoomTile* tile = &room->tiles[i];
++        if (tile->tileDepth != depth) continue;
++        tile->x += ix;
++        tile->y += iy;
++    }
+     return RValue_makeUndefined();
+ }
+ 
+@@ -15274,6 +15451,7 @@ static RValue builtin_tile_add(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_
+     tile->scaleY = 1.0f;
+     tile->color = 0xFFFFFFFFu;
+     tile->alpha = 1.0f;
++    tile->hidden = false;
+     room->tileCount = newCount;
+ 
+     runner->drawableListStructureDirty = true;
+@@ -16286,6 +16464,15 @@ static RValue builtin_layer_tile_visible(VMContext* ctx, RValue* args, MAYBE_UNU
+     Runner* runner = ctx->runner;
+     int32_t id = RValue_toInt32(args[0]);
+     bool visible = RValue_toBool(args[1]);
++    if (!DataWin_isVersionAtLeast(ctx->dataWin, 2, 0, 0, 0)) {
++        // GM:S 1.x: tiles live in the room's tile list, not in layer elements.
++        Room* room = runner->currentRoom;
++        if (room == nullptr) return RValue_makeUndefined();
++        repeat(room->tileCount, i) {
++            if (room->tiles[i].instanceID == (uint32_t) id) { room->tiles[i].hidden = !visible; break; }
++        }
++        return RValue_makeUndefined();
++    }
+     RuntimeLayerElement* el = Runner_findLayerElementById(runner, id, nullptr);
+     if (el == nullptr || el->type != RuntimeLayerElementType_Tile) return RValue_makeUndefined();
+     el->visible = visible;
+@@ -18779,6 +18966,8 @@ static RValue jsonDecodeValue(VMContext* ctx, JsonValue* json) {
+             for (int i = 0; i < len; i++) {
+                 JsonValue* item = JsonReader_getArrayElement(json, i);
+                 RValue val = jsonDecodeValue(ctx, item);
++                if (item != nullptr && (item->type == JSON_ARRAY || item->type == JSON_OBJECT))
++                    dsAddChild(ctx->runner, DS_TYPE_LIST, listId, item->type == JSON_ARRAY ? DS_TYPE_LIST : DS_TYPE_MAP, RValue_toInt32(val));
+                 DsList* list = dsListGet(ctx->runner, listId);
+                 if (list != NULL) {
+                     arrput(list->items, val);
+@@ -18796,6 +18985,8 @@ static RValue jsonDecodeValue(VMContext* ctx, JsonValue* json) {
+                 const char* key = JsonReader_getJsonKeyByIndex(json, i);
+                 JsonValue* valJson = JsonReader_getJsonValueByIndex(json, i);
+                 RValue val = jsonDecodeValue(ctx, valJson);
++                if (valJson != nullptr && (valJson->type == JSON_ARRAY || valJson->type == JSON_OBJECT))
++                    dsAddChild(ctx->runner, DS_TYPE_MAP, mapId, valJson->type == JSON_ARRAY ? DS_TYPE_LIST : DS_TYPE_MAP, RValue_toInt32(val));
+                 DsMapEntry** mapPtr = dsMapGet(ctx->runner, mapId);
+                 if (mapPtr != nullptr) {
+                     char* keyCopy = safeStrdup(key);
+@@ -23121,6 +23312,274 @@ static RValue builtin_physics_raycast(VMContext* ctx, RValue* args, int32_t coun
+ 
+ // ===[ REGISTRATION ]===
+ 
++
++// ===[ Functions missing for GM:S 1.4 games ]===
++
++
++static RValue builtin_random_get_seed(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeReal((GMLReal) g_lastRandomSeed);
++}
++
++static RValue builtin_noop_undefined(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeUndefined();
++}
++
++// GMSched extension (Windows timer resolution helper). Meaningless off Windows.
++static RValue builtin_scheduler_resolution_get(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeReal(1.0);
++}
++static RValue builtin_scheduler_resolution_set(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeReal(1.0);
++}
++
++static RValue builtin_audio_group_stop_all(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("audio_group_stop_all", 1, RValue_makeUndefined());
++    AudioSystem* audio = ctx->runner->audioSystem;
++    if (audio == nullptr || audio->vtable == nullptr || audio->vtable->stopSound == nullptr) return RValue_makeUndefined();
++    int32_t group = RValue_toInt32(args[0]);
++    DataWin* dw = ctx->runner->dataWin;
++    repeat(dw->sond.count, i) {
++        Sound* snd = &dw->sond.sounds[i];
++        if (!snd->present || snd->audioGroup != group) continue;
++        // stopSound with a sound index stops every playing instance of that sound
++        audio->vtable->stopSound(audio, (int32_t) i);
++    }
++    return RValue_makeUndefined();
++}
++
++static RValue builtin_sound_get_name(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("sound_get_name", 1, RValue_makeString("<undefined>"));
++    DataWin* dw = ctx->runner->dataWin;
++    int32_t idx = RValue_toInt32(args[0]);
++    if (0 > idx || (uint32_t) idx >= dw->sond.count || dw->sond.sounds[idx].name == nullptr) return RValue_makeString("<undefined>");
++    return RValue_makeString(dw->sond.sounds[idx].name);
++}
++
++static RValue builtin_script_exists(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("script_exists", 1, RValue_makeBool(false));
++    if (args[0].type == RVALUE_UNDEFINED) return RValue_makeBool(false);
++    int32_t idx = RValue_toInt32(args[0]);
++    DataWin* dw = ctx->runner->dataWin;
++    return RValue_makeBool(idx >= 0 && (uint32_t) idx < dw->scpt.count && dw->scpt.scripts[idx].present);
++}
++
++static RValue builtin_script_get_name(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("script_get_name", 1, RValue_makeString("<undefined>"));
++    int32_t idx = RValue_toInt32(args[0]);
++    DataWin* dw = ctx->runner->dataWin;
++    if (0 > idx || (uint32_t) idx >= dw->scpt.count || dw->scpt.scripts[idx].name == nullptr) return RValue_makeString("<undefined>");
++    return RValue_makeString(dw->scpt.scripts[idx].name);
++}
++
++static RValue builtin_filename_ext(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("filename_ext", 1, RValue_makeOwnedString(safeStrdup("")));
++    char* fname = RValue_toString(args[0], ctx->runner->dataWin);
++    if (fname == nullptr) return RValue_makeOwnedString(safeStrdup(""));
++    char* lastBackslash = strrchr(fname, '\\');
++    char* lastSlash = strrchr(fname, '/');
++    char* lastSep = lastBackslash > lastSlash ? lastBackslash : lastSlash;
++    char* dot = strrchr(fname, '.');
++    char* result = (dot != nullptr && (lastSep == nullptr || dot > lastSep)) ? safeStrdup(dot) : safeStrdup("");
++    free(fname);
++    return RValue_makeOwnedString(result);
++}
++
++static RValue builtin_ds_map_find_last(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_map_find_last", 1, RValue_makeUndefined());
++    DsMapEntry** mapPtr = dsMapGet(ctx->runner, RValue_toInt32(args[0]));
++    if (mapPtr == nullptr || shlen(*mapPtr) == 0) return RValue_makeUndefined();
++    return RValue_makeOwnedString(safeStrdup((*mapPtr)[shlen(*mapPtr) - 1].key));
++}
++
++// list[| pos] op= val (GM:S 1.4 accessor). Sets the value and returns it.
++static RValue builtin_ds_list_set_post(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_list_set_post", 3, RValue_makeUndefined());
++    RValue setArgs[3] = { args[0], args[1], args[2] };
++    builtin_ds_list_set(ctx, setArgs, 3);
++    return RValue_makeIndependent(args[2]);
++}
++
++// grid[# x, y] op= val (GM:S 1.4 accessor). Sets the value and returns it.
++static RValue builtin_ds_grid_set_post(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_set_post", 4, RValue_makeUndefined());
++    RValue setArgs[4] = { args[0], args[1], args[2], args[3] };
++    builtin_ds_grid_set(ctx, setArgs, 4);
++    return RValue_makeIndependent(args[3]);
++}
++
++static void dsGridFillRegion(DsGrid* grid, int32_t x1, int32_t y1, int32_t x2, int32_t y2, RValue val) {
++    if (x1 > x2) { int32_t t = x1; x1 = x2; x2 = t; }
++    if (y1 > y2) { int32_t t = y1; y1 = y2; y2 = t; }
++    if (0 > x1) x1 = 0;
++    if (0 > y1) y1 = 0;
++    if (x2 >= grid->width) x2 = grid->width - 1;
++    if (y2 >= grid->height) y2 = grid->height - 1;
++    for (int32_t y = y1; y2 >= y; y++) {
++        for (int32_t x = x1; x2 >= x; x++) {
++            RValue* slot = &grid->items[x + (y * grid->width)];
++            RValue_free(slot);
++            *slot = RValue_makeIndependent(val);
++        }
++    }
++}
++
++static RValue builtin_ds_grid_clear(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_clear", 2, RValue_makeUndefined());
++    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    if (grid == nullptr || grid->width <= 0 || grid->height <= 0) return RValue_makeUndefined();
++    dsGridFillRegion(grid, 0, 0, grid->width - 1, grid->height - 1, args[1]);
++    return RValue_makeUndefined();
++}
++
++static RValue builtin_ds_grid_set_region(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_set_region", 6, RValue_makeUndefined());
++    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    if (grid == nullptr || grid->width <= 0 || grid->height <= 0) return RValue_makeUndefined();
++    dsGridFillRegion(grid, RValue_toInt32(args[1]), RValue_toInt32(args[2]), RValue_toInt32(args[3]), RValue_toInt32(args[4]), args[5]);
++    return RValue_makeUndefined();
++}
++
++// --- Room editing ---
++
++static Room* roomForEditing(VMContext* ctx, int32_t roomId) {
++    DataWin* dw = ctx->runner->dataWin;
++    if (0 > roomId || (uint32_t) roomId >= dw->room.count) return nullptr;
++    Room* room = &dw->room.rooms[roomId];
++    if (!room->payloadLoaded) DataWin_loadRoomPayload(dw, roomId);
++    return room;
++}
++
++static RValue builtin_room_set_view_enabled(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("room_set_view_enabled", 2, RValue_makeUndefined());
++    Room* room = roomForEditing(ctx, RValue_toInt32(args[0]));
++    if (room == nullptr) return RValue_makeUndefined();
++    if (RValue_toBool(args[1])) room->flags |= 1u; else room->flags &= ~1u;
++    return RValue_makeUndefined();
++}
++
++// room_set_view(ind, vind, visible, xview, yview, wview, hview, xport, yport, wport, hport, hborder, vborder, hspeed, vspeed, obj)
++static RValue builtin_room_set_view(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("room_set_view", 16, RValue_makeUndefined());
++    Room* room = roomForEditing(ctx, RValue_toInt32(args[0]));
++    int32_t vind = RValue_toInt32(args[1]);
++    if (room == nullptr || room->views == nullptr || 0 > vind || vind >= 8) return RValue_makeUndefined();
++    RoomView* v = &room->views[vind];
++    v->enabled = RValue_toBool(args[2]);
++    v->viewX = RValue_toInt32(args[3]);
++    v->viewY = RValue_toInt32(args[4]);
++    v->viewWidth = RValue_toInt32(args[5]);
++    v->viewHeight = RValue_toInt32(args[6]);
++    v->portX = RValue_toInt32(args[7]);
++    v->portY = RValue_toInt32(args[8]);
++    v->portWidth = RValue_toInt32(args[9]);
++    v->portHeight = RValue_toInt32(args[10]);
++    v->borderX = (uint32_t) RValue_toInt32(args[11]);
++    v->borderY = (uint32_t) RValue_toInt32(args[12]);
++    v->speedX = RValue_toInt32(args[13]);
++    v->speedY = RValue_toInt32(args[14]);
++    v->objectId = RValue_toInt32(args[15]);
++    return RValue_makeUndefined();
++}
++
++// Butterscotch's current room *is* the room definition, so clearing it clears the live tiles too.
++// GM:S 1.4 games call this right before re-adding a scene's tiles with tile_add.
++static RValue builtin_room_tile_clear(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("room_tile_clear", 1, RValue_makeUndefined());
++    Room* room = roomForEditing(ctx, RValue_toInt32(args[0]));
++    if (room == nullptr) return RValue_makeUndefined();
++    room->tileCount = 0;
++    ctx->runner->drawableListStructureDirty = true;
++    return RValue_makeUndefined();
++}
++
++// --- Tile queries (GM:S 1.x) ---
++
++static RoomTile* findTileById(VMContext* ctx, RValue idValue) {
++    Room* room = ctx->runner->currentRoom;
++    if (room == nullptr) return nullptr;
++    uint32_t id = (uint32_t) RValue_toInt32(idValue);
++    repeat(room->tileCount, i) {
++        if (room->tiles[i].instanceID == id) return &room->tiles[i];
++    }
++    return nullptr;
++}
++
++#define TILE_GETTER(fnName, expr) \
++    static RValue builtin_##fnName(VMContext* ctx, RValue* args, int32_t argCount) { \
++        REQUIRE_ARGC_AT_LEAST(#fnName, 1, RValue_makeReal(-1.0)); \
++        RoomTile* tile = findTileById(ctx, args[0]); \
++        if (tile == nullptr) return RValue_makeReal(-1.0); \
++        return RValue_makeReal((GMLReal) (expr)); \
++    }
++
++TILE_GETTER(tile_get_x, tile->x)
++TILE_GETTER(tile_get_y, tile->y)
++TILE_GETTER(tile_get_left, tile->sourceX)
++TILE_GETTER(tile_get_top, tile->sourceY)
++TILE_GETTER(tile_get_width, tile->width)
++TILE_GETTER(tile_get_height, tile->height)
++TILE_GETTER(tile_get_depth, tile->tileDepth)
++TILE_GETTER(tile_get_background, tile->backgroundDefinition)
++TILE_GETTER(tile_get_xscale, tile->scaleX)
++TILE_GETTER(tile_get_yscale, tile->scaleY)
++TILE_GETTER(tile_get_alpha, tile->alpha)
++TILE_GETTER(tile_get_blend, tile->color & 0xFFFFFFu)
++
++static RValue builtin_tile_set_scale(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("tile_set_scale", 3, RValue_makeUndefined());
++    RoomTile* tile = findTileById(ctx, args[0]);
++    if (tile == nullptr) return RValue_makeUndefined();
++    tile->scaleX = (float) RValue_toReal(args[1]);
++    tile->scaleY = (float) RValue_toReal(args[2]);
++    return RValue_makeUndefined();
++}
++
++static RValue builtin_tile_get_count(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    Room* room = ctx->runner->currentRoom;
++    return RValue_makeReal(room != nullptr ? (GMLReal) room->tileCount : 0.0);
++}
++
++static RValue builtin_tile_get_ids(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    Room* room = ctx->runner->currentRoom;
++    int32_t count = room != nullptr ? (int32_t) room->tileCount : 0;
++    GMLArray* out = GMLArray_create(ctx->dataWin, count > 0 ? count : 1);
++    repeat(count, i) {
++        *GMLArray_slot(out, (int32_t) i) = RValue_makeReal((GMLReal) room->tiles[i].instanceID);
++    }
++    return RValue_makeArray(out);
++}
++
++// background_assign(ind, source): make background `ind` show the image of `source`.
++// Tiles resolve their texture through the background at draw time, so swapping the texture page item is enough.
++static RValue builtin_background_assign(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("background_assign", 2, RValue_makeUndefined());
++    DataWin* dw = ctx->runner->dataWin;
++    int32_t dst = RValue_toInt32(args[0]);
++    int32_t src = RValue_toInt32(args[1]);
++    if (0 > dst || 0 > src || (uint32_t) dst >= dw->bgnd.count || (uint32_t) src >= dw->bgnd.count) return RValue_makeUndefined();
++    dw->bgnd.backgrounds[dst].tpagIndex = dw->bgnd.backgrounds[src].tpagIndex;
++    dw->bgnd.backgrounds[dst].transparent = dw->bgnd.backgrounds[src].transparent;
++    dw->bgnd.backgrounds[dst].smooth = dw->bgnd.backgrounds[src].smooth;
++    return RValue_makeUndefined();
++}
++
++// Loading external images at runtime isn't supported; report failure like GameMaker does for a missing file.
++static RValue builtin_background_add(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    logStubbedFunction(ctx, "background_add");
++    return RValue_makeReal(-1.0);
++}
++
++static RValue builtin_sprite_duplicate(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
++    logStubbedFunction(ctx, "sprite_duplicate");
++    // Hand back the original sprite: drawing works, edits to the "copy" affect the original.
++    return argCount > 0 ? RValue_makeReal((GMLReal) RValue_toInt32(args[0])) : RValue_makeReal(-1.0);
++}
++
++static RValue builtin_draw_getpixel_ext(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
++    logStubbedFunction(ctx, "draw_getpixel_ext");
++    return RValue_makeReal(0.0);
++}
++
+ void VMBuiltins_registerAll(VMContext* ctx) {
+     requireMessage(!ctx->registeredBuiltinFunctions, "Attempting to register all VMBuiltins, but it was already registered!");
+     ctx->registeredBuiltinFunctions = true;
+@@ -23854,9 +24313,10 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+         VM_registerBuiltin(ctx, "background_get_width", builtin_background_get_width);
+         VM_registerBuiltin(ctx, "background_get_height", builtin_background_get_height);
+         VM_registerBuiltin(ctx, "background_delete", builtin_sprite_delete);
+-        VM_registerBuiltin(ctx, "background_exists", builtin_sprite_exists);
+-        VM_registerBuiltin(ctx, "background_get_name", builtin_sprite_get_name);
+-        VM_registerBuiltin(ctx, "background_name", builtin_sprite_get_name);
++        // GM:S 1.x keeps backgrounds in their own asset list (BGND), separate from sprites.
++        VM_registerBuiltin(ctx, "background_exists", builtin_background_exists);
++        VM_registerBuiltin(ctx, "background_get_name", builtin_background_get_name);
++        VM_registerBuiltin(ctx, "background_name", builtin_background_get_name);
+     }
+     VM_registerBuiltin(ctx, "draw_enable_drawevent", builtin_draw_enable_drawevent);
+     VM_registerBuiltin(ctx, "draw_self", builtin_draw_self);
+@@ -24009,6 +24469,46 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "mp_potential_step_object", builtin_mp_potential_step_object);
+     VM_registerBuiltin(ctx, "mp_potential_settings", builtin_mp_potential_settings);
+ 
++    // Tile layers (GM:S 1.x)
++    if (!isGMS2) {
++        VM_registerBuiltin(ctx, "tile_get_x", builtin_tile_get_x);
++        VM_registerBuiltin(ctx, "tile_get_y", builtin_tile_get_y);
++        VM_registerBuiltin(ctx, "tile_get_left", builtin_tile_get_left);
++        VM_registerBuiltin(ctx, "tile_get_top", builtin_tile_get_top);
++        VM_registerBuiltin(ctx, "tile_get_width", builtin_tile_get_width);
++        VM_registerBuiltin(ctx, "tile_get_height", builtin_tile_get_height);
++        VM_registerBuiltin(ctx, "tile_get_depth", builtin_tile_get_depth);
++        VM_registerBuiltin(ctx, "tile_get_background", builtin_tile_get_background);
++        VM_registerBuiltin(ctx, "tile_get_xscale", builtin_tile_get_xscale);
++        VM_registerBuiltin(ctx, "tile_get_yscale", builtin_tile_get_yscale);
++        VM_registerBuiltin(ctx, "tile_get_alpha", builtin_tile_get_alpha);
++        VM_registerBuiltin(ctx, "tile_get_blend", builtin_tile_get_blend);
++        VM_registerBuiltin(ctx, "tile_set_scale", builtin_tile_set_scale);
++        VM_registerBuiltin(ctx, "tile_get_count", builtin_tile_get_count);
++        VM_registerBuiltin(ctx, "tile_get_ids", builtin_tile_get_ids);
++        VM_registerBuiltin(ctx, "room_tile_clear", builtin_room_tile_clear);
++        VM_registerBuiltin(ctx, "room_set_view", builtin_room_set_view);
++        VM_registerBuiltin(ctx, "room_set_view_enabled", builtin_room_set_view_enabled);
++        VM_registerBuiltin(ctx, "background_assign", builtin_background_assign);
++        VM_registerBuiltin(ctx, "background_add", builtin_background_add);
++        VM_registerBuiltin(ctx, "ds_list_set_post", builtin_ds_list_set_post);
++        VM_registerBuiltin(ctx, "ds_grid_set_post", builtin_ds_grid_set_post);
++        VM_registerBuiltin(ctx, "sound_get_name", builtin_sound_get_name);
++    }
++    VM_registerBuiltin(ctx, "ds_grid_clear", builtin_ds_grid_clear);
++    VM_registerBuiltin(ctx, "ds_grid_set_region", builtin_ds_grid_set_region);
++    VM_registerBuiltin(ctx, "ds_map_find_last", builtin_ds_map_find_last);
++    VM_registerBuiltin(ctx, "filename_ext", builtin_filename_ext);
++    VM_registerBuiltin(ctx, "script_exists", builtin_script_exists);
++    VM_registerBuiltin(ctx, "script_get_name", builtin_script_get_name);
++    VM_registerBuiltin(ctx, "random_get_seed", builtin_random_get_seed);
++    VM_registerBuiltin(ctx, "audio_group_stop_all", builtin_audio_group_stop_all);
++    VM_registerBuiltin(ctx, "show_debug_overlay", builtin_noop_undefined);
++    VM_registerBuiltin(ctx, "scheduler_resolution_get", builtin_scheduler_resolution_get);
++    VM_registerBuiltin(ctx, "scheduler_resolution_set", builtin_scheduler_resolution_set);
++    VM_registerBuiltin(ctx, "sprite_duplicate", builtin_sprite_duplicate);
++    VM_registerBuiltin(ctx, "draw_getpixel_ext", builtin_draw_getpixel_ext);
++
+     // Tile layers (GM:S 1.x)
+     if (!isGMS2) {
+         VM_registerBuiltin(ctx, "tile_layer_hide", builtin_tile_layer_hide);
+diff --git a/src/vm_builtins.h b/src/vm_builtins.h
+index b900251..8f93730 100644
+--- a/src/vm_builtins.h
++++ b/src/vm_builtins.h
+@@ -112,6 +112,8 @@ typedef enum {
+     BUILTIN_VAR_BACKGROUND_ALPHA,
+     BUILTIN_VAR_BACKGROUND_COLOR,
+     BUILTIN_VAR_BACKGROUND_COLOUR,
++    BUILTIN_VAR_BACKGROUND_SHOWCOLOR,
++    BUILTIN_VAR_BACKGROUND_SHOWCOLOUR,
+ 
+     // OS constants
+     BUILTIN_VAR_OS_TYPE,
