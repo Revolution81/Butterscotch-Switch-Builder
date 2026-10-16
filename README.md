@@ -56,6 +56,7 @@ EXACT_POINTS=yes
 1. Copy the file to your SD card as `SD:/switch/<FOLDER>/<FOLDER>.nro` (for example `SD:/switch/MyGame/MyGame.nro`).
 2. Open the homebrew menu by **holding R while launching any installed game** (title override). **Don't use the Album button**: album mode gives homebrew much less memory and big games may not run.
 3. Pick your game and press A. Press HOME to quit.
+4. **The first launch can take a minute or more.** The screen may stay black while the game sets itself up. This is normal, so don't close it. Later launches are faster.
 
 **Saves** go to `SD:/switch/<FOLDER>/`. To bring a save over from Windows, copy the game's save files from `%LOCALAPPDATA%\<game name>\` into that folder.
 
@@ -68,7 +69,7 @@ EXACT_POINTS=yes
 | "Docker isn't running" | Start Docker Desktop, wait for it to say it's running, and try again. |
 | "game/data.win is missing" | The game files must sit directly inside `game` (not `game/SomeFolder/data.win`). |
 | Colours look completely wrong (for example everything red and blue) | Set `EXACT_POINTS=yes` in `settings.txt` and build again. Some GameMaker: Studio 1.4 games build their colour palette pixel by pixel and need this. |
-| Black screen, crash or stuck loading | Make sure you launched with **hold R** (title override), not the Album button. |
+| Black screen, crash or stuck loading | The first launch can take a minute or more, so give it time. If it never starts, make sure you launched with **hold R** (title override), not the Album button. | Make sure you launched with **hold R** (title override), not the Album button. |
 | It's slow | Butterscotch interprets the game's code, so heavy scenes can be slow at stock clocks. An overclock module such as sys-clk helps. |
 | Anything else | The game may use something Butterscotch doesn't support yet. Check the [Butterscotch compatibility list](https://github.com/ButterscotchRunner/Butterscotch). This kit can't promise every game works. |
 
