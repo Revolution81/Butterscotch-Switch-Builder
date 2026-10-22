@@ -19,6 +19,7 @@ Most fixes matter for **GameMaker: Studio 1.4** games, but none of them are spec
 - **`tile_layer_shift`:** didn't move the tiles.
 - **`tile_set_visible`:** did nothing for GameMaker 1.x tiles. Tiles a game hides (for example secret blocks in dark rooms) were still drawn.
 - **`ds_map_destroy` / `ds_list_destroy`:** didn't destroy nested maps and lists that came from `json_decode` or `ds_map_add_map` / `ds_map_add_list`. GameMaker destroys them together with the parent. This leaked memory every time a game loaded a JSON file (some games do it on every room change).
+- **`ds_grid_create` / `ds_grid_resize`:** new cells were `undefined`. GameMaker fills them with `0`, and games that check for `0` (for example to find the end of a list) showed the word "undefined" instead.
 - **`ds_grid_read` / `ds_grid_write`:** used the wrong cell order for GameMaker: Studio 1.x grids (magic 602, column-major).
 - **`background_get_name` / `background_exists`:** read the sprite list on GameMaker: Studio 1.x.
 - **`background_showcolour`** (GM:S 1.x) was ignored.
@@ -47,6 +48,8 @@ A build option (`EXACT_POINTS=yes` in `settings.txt`). It makes `draw_point` / `
 
 - Faster `json_decode` string parsing, `file_text_read_string` and the hex decoding used by `ds_*_read` (about 27% less work at boot in the tested game).
 - `ds_list_create` no longer rescans every list in use when looking for a free slot.
+- `string_copy` reads its string argument in place instead of copying the whole string first. Games that cut small pieces out of one long string many times per frame run much faster.
+- `sprite_create_from_surface` copies the surface on the GPU instead of reading it back to the CPU (`glReadPixels`), which made the CPU wait for the GPU. Games that rebuild a sprite from a surface every frame (for example a palette that changes colour constantly) no longer slow down on Switch.
 
 ## Not changed
 
